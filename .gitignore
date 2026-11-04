@@ -1,0 +1,107 @@
+# Python environments and caches
+/venv/
+/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build output
+/build/
+/dist/
+
+# Local datasets, experiment output, and model checkpoints
+/data/
+/results/
+/checkpoints/
+/wheelhouse/
+*.pt
+*.pth
+*.ckpt
+slurm-*.out
+
+# Jupyter autosaves
+.ipynb_checkpoints/
+
+# LaTeX auxiliary files
+*.aux
+*.out
+*.toc
+*.lof
+*.lot
+*.loa
+*.lol
+*.fls
+*.fdb_latexmk
+*.synctex
+*.synctex.gz
+*.synctex(busy)
+*.dvi
+*.xdv
+*.fmt
+*.nav
+*.snm
+*.vrb
+*.spl
+
+# Bibliography intermediates
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*-blx.bib
+
+# Index, glossary, and nomenclature intermediates
+*.idx
+*.ind
+*.ilg
+*.ist
+*.glo
+*.gls
+*.glg
+*.glsdefs
+*.acn
+*.acr
+*.alg
+*.glgslg
+*.glstex
+*.nlo
+*.nls
+*.nlg
+*.xdy
+
+# LaTeX package caches
+_minted*/
+*.pyg
+*.pygstyle
+*.pygtex
+*.w18
+*.upa
+*.upb
+*.brf
+*.thm
+*.tdo
+*.loe
+*.dpth
+*.md5
+
+# Logs
+*.log
+
+# Emacs backups, autosaves, lock files, and AUCTeX metadata
+*~
+\#*\#
+.\#*
+/.emacs.desktop
+/.emacs.desktop.lock
+**/auto/
+**/.auctex-auto/
+
+# OS metadata
+.DS_Store
+Thumbs.db
