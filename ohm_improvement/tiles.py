@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch
 
 from torch import Tensor
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from copy import deepcopy
 
 from .compensation import convert_compensation
@@ -26,13 +26,13 @@ class OITile(nn.Module):
         self,
         tile,
         n_realizations: int,
-        n_times: int,
+        t_inferences: List[float],
         g_converter: Optional[BaseConductanceConverter],
     ):
         nn.Module.__init__(self)
 
         self.n_realizations = n_realizations
-        self.n_times = n_times
+        self.t_inferences = t_inferences
 
         if tile.__class__ not in {InferenceTile}:
             raise TypeError("OITile only supports conversion of InferenceTile")
@@ -69,7 +69,7 @@ class OITile(nn.Module):
 
         self.tile = TileHolder(tile)
         self.init_conductances(g_converter)
-        self.init_noise(n_realizations, n_times)
+        self.init_noise(n_realizations, len(t_inferences))
 
     def init_conductances(
             self,
@@ -129,7 +129,6 @@ class OITile(nn.Module):
             raise ValueError("n_realizations and n_times must be positive")
 
         self.n_realizations = n_realizations
-        self.n_times = n_times
 
         n_pairs = len(self.g_plus)
         g = self.g_plus[0]
@@ -184,13 +183,13 @@ class OITile(nn.Module):
     def program_weights(
         self,
         realization_index: int,
-        time_index: int,
-        time: float,
+        time_index: int
     ) -> None:
         if not 0 <= realization_index < self.n_realizations:
             raise IndexError("realization_index out of range")
-        if not 0 <= time_index < self.n_times:
+        if not 0 <= time_index < len(self.t_inferences):
             raise IndexError("time_index out of range")
+        time = self.t_inferences[time_index]
         if time < 0:
             raise ValueError("time must be nonnegative")
 

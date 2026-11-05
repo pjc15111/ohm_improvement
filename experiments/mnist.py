@@ -78,7 +78,7 @@ def test(model, device, test_loader):
         100. * correct / len(test_loader.dataset)))
 
 
-def train_oi_epoch(oi_model, n_realizations, t_inferences, device,
+def train_oi_epoch(oi_model, realizations, t_inferences, device,
                    train_loader, optimizer, log_interval):
     total_loss = 0.0
     total_correct = 0
@@ -90,12 +90,12 @@ def train_oi_epoch(oi_model, n_realizations, t_inferences, device,
 
         optimizer.zero_grad(set_to_none=True)
 
-        n_samples = n_realizations * len(t_inferences)
+        n_samples = len(realizations) * len(t_inferences)
         count = target.numel()
 
-        for realization in range(n_realizations):
-            for t_i, t in enumerate(t_inferences):
-                oi.program_weights(oi_model, realization, t_i, t)
+        for realization in realizations:
+            for t_i in range(len(t_inferences)):
+                oi.program_weights(oi_model, realization, t_i)
                 output = oi_model(x)
                 sample_loss = F.nll_loss(output, target)
 
@@ -124,15 +124,15 @@ def train_oi_epoch(oi_model, n_realizations, t_inferences, device,
 
 
 @torch.no_grad()
-def evaluate_oi(oi_model, n_realizations, n_evaluation_realizations,
+def evaluate_oi(oi_model, realizations,
                 t_inferences, device, test_loader):
     total_loss = 0.0
     total_correct = 0
     total_predictions = 0
 
-    for realization in range(n_realizations, n_realizations + n_evaluation_realizations):
-        for t_i, t in enumerate(t_inferences):
-            oi.program_weights(oi_model, realization, t_i, t)
+    for realization in realizations:
+        for t_i in range(len(t_inferences)):
+            oi.program_weights(oi_model, realization, t_i)
             for x, target in test_loader:
                 x, target = x.to(device), target.to(device)
                 output = oi_model(x)
@@ -240,21 +240,17 @@ def main():
     oi_model = oi.convert_to_oi(
         analog_model,
         n_realizations=n_realizations + n_evaluation_realizations,
-        n_times=len(t_inferences),
+        t_inferences=t_inferences
     )
     oi_model.eval()
 
-    tiles = [
-        module for module in oi_model.modules()
-        if isinstance(module, oi.OITile)
-    ]
+    conductances = oi.optimization_parameters(
+        oi_model,
+        include_conductances=True,
+        include_output_scaling=False,
+        include_bias=False
+    )
 
-    conductances = [
-        g
-        for tile in tiles
-        for side in (tile.g_plus, tile.g_minus)
-        for g in side
-    ]
     optimizer = torch.optim.Adam(conductances, lr=0.01)
 
     history = []
@@ -262,7 +258,7 @@ def main():
     log_interval = 10
     for epoch in range(1, 2):
         start = perf_counter()
-        loss, accuracy = train_oi_epoch(oi_model, n_realizations, t_inferences,
+        loss, accuracy = train_oi_epoch(oi_model, range(n_realizations), t_inferences,
                                         device, train_loader,
                                         optimizer, log_interval)
         end = perf_counter()
@@ -273,17 +269,18 @@ def main():
             f"accuracy={100 * accuracy:.2f}%, "
             f"time taken {end - start}, "
             f"evaluation={evaluate_oi(
-                              oi_model, n_realizations,
-                              n_evaluation_realizations, t_inferences,
+                              oi_model,
+                              range(n_realizations, n_realizations + n_evaluation_realizations),
+                              t_inferences,
                               device, test_loader
                           )}"
         )
 
     for realization in range(n_realizations + n_evaluation_realizations):
-        for t_i, t in enumerate(t_inferences):
-            oi.program_weights(oi_model, realization, t_i, t)
+        for t_i in range(len(t_inferences)):
+            oi.program_weights(oi_model, realization, t_i)
             stock_model = oi.oi_to_analog(oi_model)
-            print(f"Stock evaluation: time={t}, realization={realization}")
+            print(f"Stock evaluation: time={t_inferences[t_i]}, realization={realization}")
             test(stock_model, device, test_loader)
 
 

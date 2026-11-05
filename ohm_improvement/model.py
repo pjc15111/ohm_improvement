@@ -6,7 +6,7 @@ from aihwkit.simulator.tiles.inference import (
 import torch.nn as nn
 import torch
 
-from typing import Optional
+from typing import Optional, List
 from copy import deepcopy
 
 from ohm_improvement.tiles import OITile
@@ -15,7 +15,7 @@ from ohm_improvement.tiles import OITile
 def convert_to_oi(
     module: nn.Module,
     n_realizations: int,
-    n_times: int,
+    t_inferences: List[float],
     inplace: bool = False,
     g_converter: Optional[BaseConductanceConverter] = None,
 ) -> nn.Module:
@@ -30,7 +30,7 @@ def convert_to_oi(
         module = CONVERSION_MAP[module.__class__](
             module,
             n_realizations,
-            n_times,
+            t_inferences,
             g_converter
         )
 
@@ -43,7 +43,7 @@ def convert_to_oi(
         module._modules[name] = convert_to_oi(
             mod,
             n_realizations,
-            n_times,
+            t_inferences,
             inplace=True,
             g_converter=g_converter
         )
@@ -74,20 +74,44 @@ def oi_to_analog(model, inplace=False):
 def program_weights(
     model: nn.Module,
     realization_index: int,
-    time_index: int,
-    time: float,
+    time_index: int
 ) -> None:
     """Apply one realization and timestamp to every OITile."""
     for module in model.modules():
         if isinstance(module, OITile):
             module.program_weights(
                 realization_index,
-                time_index,
-                time,
+                time_index
             )
+
 
 @torch.no_grad()
 def clamp_conductances(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, OITile):
             module.clamp_conductances()
+
+
+def optimization_parameters(
+    model,
+    include_conductances=True,
+    include_output_scaling=True,
+    include_bias=False,
+):
+    parameters = []
+
+    for tile in model.modules():
+        if not isinstance(tile, OITile):
+            continue
+
+        if include_conductances:
+            parameters.extend(tile.g_plus)
+            parameters.extend(tile.g_minus)
+
+        if include_output_scaling and tile.out_scaling_alpha is not None:
+            parameters.append(tile.out_scaling_alpha)
+
+        if include_bias and tile.digital_bias:
+            parameters.append(tile.bias)
+
+    return parameters
