@@ -28,6 +28,3 @@ python -m pip install --only-binary=:all: \
     'torch==2.10.0+cu126' \
     'https://aihwkit-gpu-demo.s3.us-east.cloud-object-storage.appdomain.cloud/aihwkit-1.1.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl'
 python -m pip check
-
-echo "Ready: $py"
-
