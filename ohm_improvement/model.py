@@ -51,7 +51,7 @@ def convert_to_oi(
     return module
 
 
-def oi_to_analog(model, inplace=False):    
+def oi_to_analog(model, inplace=False):
     if not inplace:
         memo = {
             id(module): module.to_analog()
@@ -92,11 +92,24 @@ def clamp_conductances(model: nn.Module) -> None:
             module.clamp_conductances()
 
 
+@torch.no_grad()
+def clamp_significance(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, OITile):
+            module.clamp_significance()
+
+
+def clamp_model(model: nn.Module) -> None:
+    clamp_conductances(model)
+    clamp_significance(model)
+
+
 def optimization_parameters(
     model,
     include_conductances=True,
     include_output_scaling=True,
     include_bias=False,
+    include_significance=True
 ):
     parameters = []
 
@@ -113,5 +126,8 @@ def optimization_parameters(
 
         if include_bias and tile.digital_bias:
             parameters.append(tile.bias)
+
+        if include_significance and tile.significance:
+            parameters.append(tile.significance)
 
     return parameters

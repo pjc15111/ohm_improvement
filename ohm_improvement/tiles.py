@@ -13,8 +13,13 @@ from typing import Optional, Tuple, List
 from copy import deepcopy
 
 from .compensation import convert_compensation
-from .conductance import convert_to_conductances, convert_back_to_weights
+from .conductance import (
+    convert_to_conductances,
+    convert_back_to_weights,
+    ConductanceMapping
+)
 from .noise import convert_noise_model
+
 
 class TileHolder():
     def __init__(self, tile):
@@ -28,6 +33,7 @@ class OITile(nn.Module):
         n_realizations: int,
         t_inferences: List[float],
         g_converter: Optional[BaseConductanceConverter],
+        train_significance = True
     ):
         nn.Module.__init__(self)
 
@@ -68,12 +74,13 @@ class OITile(nn.Module):
             )
 
         self.tile = TileHolder(tile)
-        self.init_conductances(g_converter)
+        self.init_conductances(train_significance, g_converter)
         self.init_noise(n_realizations, len(t_inferences))
 
     def init_conductances(
-            self,
-            g_converter: Optional[BaseConductanceConverter] = None,
+        self,
+        train_significance,
+        g_converter: Optional[BaseConductanceConverter] = None,
     ) -> None:
         tile = self.tile.tile
 
@@ -109,19 +116,19 @@ class OITile(nn.Module):
         self.active_weights = None
 
         with torch.no_grad():
-            (g_plus, g_minus), scale = convert_to_conductances(
-                self.g_converter, weights
-            )
-
-        # TODO: Add trainable significance per weight
+            mapping = convert_to_conductances(self.g_converter, weights)
 
         self.g_plus = nn.ParameterList(
-            [nn.Parameter(g.detach().clone()) for g in g_plus]
+            [nn.Parameter(g.detach().clone()) for g in mapping.g_plus]
         )
         self.g_minus = nn.ParameterList(
-            [nn.Parameter(g.detach().clone()) for g in g_minus]
+            [nn.Parameter(g.detach().clone()) for g in mapping.g_minus]
         )
-        self.register_buffer("scale", scale.detach().clone())
+        self.significance = nn.Parameter(
+            mapping.significance.detach().clone(),
+            requires_grad=train_significance,
+        )
+        self.register_buffer("scale", mapping.scale.detach().clone())
 
     def init_noise(self, n_realizations: int, n_times: int) -> None:
         """Sample fixed randomness for programming, drift, and read noise."""
@@ -175,9 +182,12 @@ class OITile(nn.Module):
 
     def install_conductances(self, gp, gm):
         self.active_weights = convert_back_to_weights(
-            self.g_converter,
-            (gp, gm),
-            self.scale,
+            ConductanceMapping(
+                g_plus=gp,
+                g_minus=gm,
+                significance=self.significance,
+                scale=self.scale,
+            )
         ).contiguous()
 
     def program_weights(
@@ -267,6 +277,10 @@ class OITile(nn.Module):
             for g in side:
                 g.clamp_(self.g_converter.g_min, self.g_converter.g_max)
 
+    @torch.no_grad()
+    def clamp_significance(self):
+        self.significance.clamp_(0.1, 5.0)
+
     def to_analog(self):
         if self.active_weights is None:
             raise RuntimeError("Call program_weights() before to_analog()")
@@ -305,6 +319,10 @@ class OITile(nn.Module):
 
         tile.rpu_config.drift_compensation = deepcopy(
             self.original_drift_compensation
+        )
+
+        tile.rpu_config.noise_model.g_converter.f_lst = (
+            self.significance.detach().cpu().tolist()
         )
 
         if self.out_scaling_alpha is not None:

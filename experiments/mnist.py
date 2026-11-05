@@ -108,7 +108,7 @@ def train_oi_epoch(oi_model, realizations, t_inferences, device,
                 total_predictions += count
 
         optimizer.step()
-        oi.clamp_conductances(oi_model)
+        oi.clamp_model(oi_model)
 
         if batch_idx % log_interval == 0:
             print(
