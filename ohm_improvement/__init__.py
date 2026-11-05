@@ -3,6 +3,7 @@ from .model import (
     program_weights,
     clamp_conductances,
     oi_to_analog,
-    optimization_parameters
+    optimization_parameters,
+    clamp_model
 )
 from .tiles import OITile
