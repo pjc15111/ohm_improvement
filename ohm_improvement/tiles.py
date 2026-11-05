@@ -85,9 +85,19 @@ class OITile(nn.Module):
 
         self.g_converter = deepcopy(g_converter)
 
-        # Keep the tile's native weight layout, including CUDA's transpose.
-        # These are raw tile weights: mapping/output scales remain separate.
-        weights = tile.shared_weights.detach().clone()
+        # Read raw tile weights, without mapping or learned output scaling.
+        weights, _ = tile.get_weights(apply_weight_scaling=False)
+        weights = weights.detach().to(
+            device=tile.shared_weights.device,
+            dtype=tile.shared_weights.dtype,
+        )
+
+        # get_weights() returns [out_features, in_features].
+        # Preserve the native layout expected by our installation code.
+        if tile.shared_weights.is_cuda:
+            weights = weights.T
+
+        weights = weights.contiguous().clone()
 
         if "shared_weights" in tile._parameters:
             del tile._parameters["shared_weights"]
