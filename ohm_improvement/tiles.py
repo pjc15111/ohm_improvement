@@ -14,7 +14,7 @@ from copy import deepcopy
 
 from .compensation import convert_compensation
 from .conductance import convert_to_conductances, convert_back_to_weights
-
+from .noise import convert_noise_model
 
 class TileHolder():
     def __init__(self, tile):
@@ -48,6 +48,10 @@ class OITile(nn.Module):
             self.original_drift_compensation
         )
         tile.rpu_config.drift_compensation = None
+
+        if not hasattr(tile.rpu_config, "noise_model"):
+            raise Exception("Seems that RPUConfig is not of type InferenceRPUConfig.")
+        self.noise_model = convert_noise_model(tile.rpu_config.noise_model)
 
         self.out_scaling_alpha = None
         if tile.out_scaling_alpha is not None:
@@ -87,7 +91,12 @@ class OITile(nn.Module):
 
         if "shared_weights" in tile._parameters:
             del tile._parameters["shared_weights"]
-        tile.shared_weights = None
+
+        # Mutable backend holder, never passed as the autograd weight argument.
+        tile.shared_weights = weights.detach().clone()
+
+        # Set by install_conductances().
+        self.active_weights = None
 
         with torch.no_grad():
             (g_plus, g_minus), scale = convert_to_conductances(
@@ -143,22 +152,24 @@ class OITile(nn.Module):
         return values
 
     def analog_forward(self, x_input):
+        if self.active_weights is None:
+            raise RuntimeError("Call program_weights() before forward()")
+
+        tile = self.tile.tile
         return AnalogFunction.apply(
-            self.tile.tile.get_analog_ctx(),
-            self.tile.tile,
+            tile.get_analog_ctx(),
+            tile,
             x_input,
-            self.tile.tile.shared_weights,
-            not self.training
+            self.active_weights,
+            not self.training,
         )
 
     def install_conductances(self, gp, gm):
-        weights = convert_back_to_weights(
+        self.active_weights = convert_back_to_weights(
             self.g_converter,
             (gp, gm),
-            self.scale
-        )
-
-        self.tile.tile.shared_weights = weights.contiguous()
+            self.scale,
+        ).contiguous()
 
     def program_weights(
         self,
@@ -182,13 +193,13 @@ class OITile(nn.Module):
         for side, targets in enumerate((self.g_plus, self.g_minus)):
             for p, g_target in enumerate(targets):
                 programmed[side].append(
-                    self.noise.apply_programming_noise_to_conductance(
+                    self.noise_model.apply_programming_noise_to_conductance(
                         g_target,
                         self.prog_noise[p, side, r],
                     )
                 )
                 drift_coefficients[side].append(
-                    self.noise.generate_drift_coefficients(
+                    self.noise_model.generate_drift_coefficients(
                         g_target,
                         self.drift_noise[p, side, r],
                     )
@@ -197,7 +208,10 @@ class OITile(nn.Module):
         # Compensation reference: programmed state, before drift.
         if self.compensation is not None:
             self.install_conductances(*programmed)
-            self.reference = self.compensation.init_baseline(self.tile.tile)
+            self.reference = self.compensation.init_baseline(
+                self.tile.tile,
+                self.active_weights
+            )
 
         drifted = ([], [])
 
@@ -206,7 +220,7 @@ class OITile(nn.Module):
                     zip(programmed[side], drift_coefficients[side])
             ):
                 drifted[side].append(
-                    self.noise.apply_drift_noise_to_conductance(
+                    self.noise_model.apply_drift_noise_to_conductance(
                         g_prog,
                         nu,
                         time,
@@ -219,13 +233,13 @@ class OITile(nn.Module):
     def forward(
         self, x_input: Tensor, tensor_view: Optional[Tuple[int, ...]] = None
     ) -> Tensor:
-        probe = self.compensation.get_readout_tensor(
-            self.tile.tile.in_size
-        ).to(self.tile.tile.shared_weights)
-        probe_output = self.analog_forward(probe)
 
         output = self.analog_forward(x_input)
         if self.compensation is not None:
+            probe = self.compensation.get_readout_tensor(
+                self.tile.tile.in_size
+            ).to(self.tile.active_weights)
+            probe_output = self.analog_forward(probe)
             output = self.compensation.apply(
                 probe_output, self.reference, output
             )
@@ -238,5 +252,59 @@ class OITile(nn.Module):
             return out + self.bias.view(*tensor_view)
         return out
 
-    def to_analog(self, device):
-        pass
+    def to_analog(self):
+        if self.active_weights is None:
+            raise RuntimeError("Call program_weights() before to_analog()")
+
+        tile = deepcopy(self.tile.tile)
+
+        # Independent storage, registered for ordinary PyTorch handling.
+        tile.shared_weights = nn.Parameter(
+            self.active_weights.detach().clone(),
+            requires_grad=False,
+        )
+
+        with torch.no_grad():
+            if self.compensation is not None:
+                probe = self.compensation.get_readout_tensor(
+                    tile.in_size
+                ).to(tile.shared_weights)
+
+                # Stock compensation is still disabled here.
+                probe_output = AnalogFunction.apply(
+                    tile.get_analog_ctx(),
+                    tile,
+                    probe,
+                    tile.shared_weights,
+                    True,
+                )
+
+                current_readout = self.compensation.readout(probe_output)
+                tile.alpha = (
+                    self.reference / current_readout
+                ).detach().clone()
+                tile.drift_baseline = self.reference.detach().clone()
+
+            # Bind the exported weights even when compensation is disabled.
+            tile.ensure_shared_weights(tile.shared_weights)
+
+        tile.rpu_config.drift_compensation = deepcopy(
+            self.original_drift_compensation
+        )
+
+        if self.out_scaling_alpha is not None:
+            tile.out_scaling_alpha = nn.Parameter(
+                self.out_scaling_alpha.detach().clone(),
+                requires_grad=self.out_scaling_alpha.requires_grad,
+            )
+        else:
+            tile.out_scaling_alpha = None
+
+        if self.digital_bias:
+            tile.bias = nn.Parameter(
+                self.bias.detach().clone(),
+                requires_grad=self.bias.requires_grad,
+            )
+
+        tile.eval()
+        return tile

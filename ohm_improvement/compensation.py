@@ -39,7 +39,13 @@ class DifferentiableBaseDriftCompensation:
     # CHANGE: No @no_grad decorator
     # CHANGE: Correct the original return annotation; this method
     # returns a single reference Tensor.
-    def init_baseline(self, tile: "InferenceTileWithPeriphery") -> Tensor:
+    # CHANGE: Now accepts the weights as an argument to let us manage
+    # lifetime manually.
+    def init_baseline(
+        self,
+        tile: "InferenceTileWithPeriphery",
+        weights: Tensor
+    ) -> Tensor:
         """Initialize the base line for applying the compensation.
 
         Uses a all one tensor for read_out.
@@ -59,7 +65,7 @@ class DifferentiableBaseDriftCompensation:
             tile.get_analog_ctx(),
             tile,
             probe,
-            tile.shared_weights,
+            weights,
             True,
         )
 

@@ -48,3 +48,19 @@ def convert_to_oi(
         )
 
     return module
+
+
+def program_weights(
+    model: nn.Module,
+    realization_index: int,
+    time_index: int,
+    time: float,
+) -> None:
+    """Apply one realization and timestamp to every OITile."""
+    for module in model.modules():
+        if isinstance(module, OITile):
+            module.program_weights(
+                realization_index,
+                time_index,
+                time,
+            )
