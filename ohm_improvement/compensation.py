@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aihwkit.simulator.tiles.inference import InferenceTileWithPeriphery
 
-    
+
 class DifferentiableBaseDriftCompensation:
     r"""Base class for drift compensations with autograd support.
 

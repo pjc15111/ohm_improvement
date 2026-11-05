@@ -1,6 +1,7 @@
 from aihwkit.inference.converter.conductance import (
     SinglePairConductanceConverter
 )
+from aihwkit.inference.converter.base import BaseConductanceConverter
 
 from torch import Tensor
 
@@ -48,3 +49,40 @@ def single_pair_to_weights(
         (g_plus[0] - converter.g_min)
         - (g_minus[0] - converter.g_min)
     ) / scale
+
+
+_CONVERTER_FUNCTIONS = {
+    SinglePairConductanceConverter: (
+        single_pair_to_conductances,
+        single_pair_to_weights,
+    ),
+}
+
+
+def _converter_functions(converter: BaseConductanceConverter):
+    try:
+        return _CONVERTER_FUNCTIONS[type(converter)]
+    except KeyError:
+        raise NotImplementedError(
+            f"Unsupported conductance converter: "
+            f"{type(converter).__name__}"
+        ) from None
+
+
+def convert_to_conductances(
+    converter: BaseConductanceConverter,
+    weights: Tensor,
+) -> Tuple[Tuple[List[Tensor], List[Tensor]], Tensor]:
+    """Convert weights into positive/negative conductance lists and a scale."""
+    to_conductances, _ = _converter_functions(converter)
+    return to_conductances(converter, weights)
+
+
+def convert_back_to_weights(
+    converter: BaseConductanceConverter,
+    conductances: Tuple[List[Tensor], List[Tensor]],
+    scale: Tensor,
+) -> Tensor:
+    """Reconstruct logical weights from conductances and their scale."""
+    _, to_weights = _converter_functions(converter)
+    return to_weights(converter, conductances, scale)
