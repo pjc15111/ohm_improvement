@@ -27,6 +27,9 @@ class DifferentiablePCMLikeNoiseModel:
            calculation to prevent invalid gradients at zero
            conductance.
         5. We no longer extend BaseNoiseModel.
+        6. Fixed a bug that caused self.prog_coeff_g_max_reference
+           to not be initialized when both prog_coeff_g_max_reference
+           and prog_coeff are not None.
 
     The statistical equations and default parameters otherwise follow
     the original model.
@@ -48,13 +51,6 @@ class DifferentiablePCMLikeNoiseModel:
       custom coefficients can specify a different degree.
     - The constructor documentation refers to "prog_coeffs", but the
       argument is named "prog_coeff".
-
-    Known defect inherited from AIHWKIT's PCMLikeNoiseModel:
-    The value of the argument prog_coeff_g_max_reference is never used.
-    When both prog_coeff and prog_coeff_g_max_reference are not None,
-    self.prog_coeff_g_max_reference is not initialized. Subsequently
-    computing programming noise raises AttributeError. Retained here
-    to keep changes limited to differentiability.
 
     Original documentation follows.
 
@@ -111,6 +107,10 @@ class DifferentiablePCMLikeNoiseModel:
 
         if prog_coeff_g_max_reference is None:
             self.prog_coeff_g_max_reference = self.g_max
+        # CHANGE: Use the value of prog_coeff_g_max_reference if it is
+        # not none.
+        else:
+            self.prog_coeff_g_max_reference = prog_coeff_g_max_reference
 
         if prog_coeff is None:
             # standard g_max are defined in respect to 25.0 uS. Need to
