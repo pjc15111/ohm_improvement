@@ -143,7 +143,7 @@ def evaluate_oi(oi_model, n_realizations, n_evaluation_realizations,
                     reduction="sum",
                 ).item()
                 total_correct += (
-                    output.argmax(dim=-1) == targets
+                    output.argmax(dim=-1) == target
                 ).sum().item()
                 total_predictions += target.numel()
 
@@ -262,7 +262,7 @@ def main():
     log_interval = 10
     for epoch in range(1, 2):
         start = perf_counter()
-        loss, accuracy = train_oi_epoch(model, n_realizations, t_inferences,
+        loss, accuracy = train_oi_epoch(oi_model, n_realizations, t_inferences,
                                         device, train_loader,
                                         optimizer, log_interval)
         end = perf_counter()

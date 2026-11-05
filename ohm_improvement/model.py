@@ -4,6 +4,7 @@ from aihwkit.simulator.tiles.inference import (
     InferenceTile
 )
 import torch.nn as nn
+import torch
 
 from typing import Optional
 from copy import deepcopy
@@ -52,15 +53,23 @@ def convert_to_oi(
 
 def oi_to_analog(model, inplace=False):    
     if not inplace:
+        memo = {
+            id(module): module.to_analog()
+            for module in model.modules()
+            if isinstance(module, OITile)
+        }
+        return deepcopy(model, memo)
         model = deepcopy(model)
 
-    if model.__class__ == OITile:
-        model = model.to_analog()
+    if isinstance(model, OITile):
+        return model.to_analog()
 
-    for name, mod in model.named_children():
-        model._modules[name] = oi_to_analog(mod, inplace=True)
+    for name, child in model.named_children():
+        if child is not None:
+            model._modules[name] = oi_to_analog(child, inplace=True)
 
     return model
+
 
 def program_weights(
     model: nn.Module,
@@ -77,6 +86,7 @@ def program_weights(
                 time,
             )
 
+@torch.no_grad()
 def clamp_conductances(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, OITile):
