@@ -78,9 +78,8 @@ def test(model, device, test_loader):
         100. * correct / len(test_loader.dataset)))
 
 
-def train_oi_epoch(ensemble, device, train_loader, optimizer, epoch, log_interval):
-    ensemble.eval()  # Analog inference behavior; gradients remain enabled.
-
+def train_oi_epoch(oi_model, n_realizations, t_inferences, device,
+                   train_loader, optimizer, log_interval):
     total_loss = 0.0
     total_correct = 0
     total_predictions = 0
@@ -91,30 +90,25 @@ def train_oi_epoch(ensemble, device, train_loader, optimizer, epoch, log_interva
 
         optimizer.zero_grad(set_to_none=True)
 
-        # [realization, time, batch, class]
-        outputs = ensemble(x)
-        targets = target[None, None, :].expand(outputs.shape[:-1])
+        n_samples = n_realizations * len(t_inferences)
+        count = target.numel()
 
-        loss = F.nll_loss(
-            outputs.reshape(-1, outputs.shape[-1]),
-            targets.reshape(-1),
-        )
+        for realization in range(n_realizations):
+            for t_i, t in enumerate(t_inferences):
+                oi.program_weights(oi_model, realization, t_i, t)
+                output = oi_model(x)
+                sample_loss = F.nll_loss(output, target)
 
-        loss.backward()
+                (sample_loss / n_samples).backward()
+
+                total_loss += sample_loss.item() * count
+                total_correct += (
+                    output.argmax(dim=-1) == target
+                ).sum().item()
+                total_predictions += count
+
         optimizer.step()
-
-        with torch.no_grad():
-            for g in ensemble.g_plus:
-                g.clamp_(g_min, g_max)
-            for g in ensemble.g_minus:
-                g.clamp_(g_min, g_max)
-
-            count = targets.numel()
-            total_loss += loss.item() * count
-            total_correct += (
-                outputs.argmax(dim=-1) == targets
-            ).sum().item()
-            total_predictions += count
+        oi.clamp_conductances(oi_model)
 
         if batch_idx % log_interval == 0:
             print(
@@ -130,121 +124,33 @@ def train_oi_epoch(ensemble, device, train_loader, optimizer, epoch, log_interva
 
 
 @torch.no_grad()
-def evaluate_oi(ensemble, device, test_loader):
-    ensemble.eval()
+def evaluate_oi(oi_model, n_realizations, n_evaluation_realizations,
+                t_inferences, device, test_loader):
     total_loss = 0.0
     total_correct = 0
     total_predictions = 0
 
-    for x, target in test_loader:
-        x, target = x.to(device), target.to(device)
-        outputs = ensemble(x)
-        targets = target[None, None, :].expand(outputs.shape[:-1])
+    for realization in range(n_realizations, n_realizations + n_evaluation_realizations):
+        for t_i, t in enumerate(t_inferences):
+            oi.program_weights(oi_model, realization, t_i, t)
+            for x, target in test_loader:
+                x, target = x.to(device), target.to(device)
+                output = oi_model(x)
 
-        total_loss += F.nll_loss(
-            outputs.reshape(-1, outputs.shape[-1]),
-            targets.reshape(-1),
-            reduction="sum",
-        ).item()
-        total_correct += (
-            outputs.argmax(-1) == targets
-        ).sum().item()
-        total_predictions += targets.numel()
+                total_loss += F.nll_loss(
+                    output,
+                    target,
+                    reduction="sum",
+                ).item()
+                total_correct += (
+                    output.argmax(dim=-1) == targets
+                ).sum().item()
+                total_predictions += target.numel()
 
     return {
         "loss": total_loss / total_predictions,
         "accuracy": total_correct / total_predictions,
     }
-
-
-@torch.no_grad()
-def make_stock_realization(
-    digital_model, ensemble, rpu_config, t_inference, device
-):
-    """Evaluate optimized pairs through stock noise and inference code."""
-    config = deepcopy(rpu_config)
-    config.drift_compensation = GlobalDriftCompensation()
-
-    # Our conductance inverse already returns full logical weights.
-    config.mapping.weight_scaling_omega = 0.0
-    config.mapping.learn_out_scaling = False
-
-    stock_model = convert_to_analog(
-        deepcopy(digital_model), rpu_config=config
-    ).to(device)
-    stock_model.eval()
-
-    converter = SinglePairConductanceConverter(
-        g_min=g_min, g_max=g_max
-    )
-
-    # Match our noise-model configuration, using the original methods.
-    source_noise = ensemble.simulators[0].noise
-    stock_noise = PCMLikeNoiseModel(
-        g_converter=converter,
-        prog_coeff=list(source_noise.prog_coeff),
-        t_read=source_noise.t_read,
-        t_0=source_noise.t_0,
-        prog_noise_scale=source_noise.prog_noise_scale,
-        read_noise_scale=source_noise.read_noise_scale,
-        drift_scale=source_noise.drift_scale,
-    )
-
-    # Avoid the upstream constructor bug discussed earlier.
-    stock_noise.prog_coeff_g_max_reference = (
-        source_noise.prog_coeff_g_max_reference
-    )
-
-    scales = ensemble.simulators[0].scales
-
-    for i, name in enumerate(("l1", "l2")):
-        layer = getattr(stock_model, name)
-        tiles = list(layer.analog_tiles())
-        assert len(tiles) == 1
-        tile = tiles[0]
-        assert tile.digital_bias
-
-        bias = getattr(digital_model, name).bias.detach()
-        targets = [
-            ensemble.g_plus[i].detach().to(device),
-            ensemble.g_minus[i].detach().to(device),
-        ]
-        params = {"scale_ratio": scales[i]}
-
-        programmed = [
-            stock_noise.apply_programming_noise_to_conductance(g)
-            for g in targets
-        ]
-        nus = [
-            stock_noise.generate_drift_coefficients(g)
-            for g in targets
-        ]
-
-        # Establish the reference after programming, before drift.
-        reference_weights = converter.convert_back_to_weights(
-            programmed, params
-        )
-        layer.set_weights(reference_weights, bias)
-
-        compensation = tile.rpu_config.drift_compensation
-        reference = compensation.init_baseline(tile)
-
-        drifted = [
-            stock_noise.apply_drift_noise_to_conductance(g, nu, t_inference)
-            for g, nu in zip(programmed, nus)
-        ]
-        drifted_weights = converter.convert_back_to_weights(
-            drifted, params
-        )
-        layer.set_weights(drifted_weights, bias)
-
-        # Use the original calibration readout and correction.
-        readout = tile._forward_drift_readout_tensor(
-            False, exact_reference=False
-        )
-        tile.alpha = compensation.apply(readout, reference)
-
-    return stock_model
 
 
 def main():
@@ -314,58 +220,51 @@ def main():
     if args.save_model:
         torch.save(model.state_dict(), "mnist_nn.pt")
 
-    rpu_config = InferenceRPUConfig(drift_compensation = None)
+    rpu_config = InferenceRPUConfig()
+    rpu_config.drift_compensation = GlobalDriftCompensation()
     rpu_config.mapping.max_input_size = 0
     rpu_config.mapping.max_output_size = 0
     rpu_config.forward.is_perfect = False
 
     model.eval()
 
-    compensation = oi.DifferentiableGlobalDriftCompensation()
-    noise = oi.DifferentiablePCMLikeNoiseModel()
-
     n_realizations = 4
+    n_evaluation_realizations = 4
     t_inferences = [86400, 30 * 86400, 365 * 86400]  # 1 day, 30 days, 1 year
     device = next(model.parameters()).device
 
-    weights = [model.l1.weight, model.l2.weight]
-    scales = [
-        oi.calculate_scale(w, g_max, g_min)
-        for w in weights
-    ]
+    analog_model = convert_to_analog(
+        model, rpu_config=rpu_config
+    ).to(device)
 
-    with torch.no_grad():
-        pairs = [
-            oi.logical_to_differential(w, s, g_min)
-            for w, s in zip(weights, scales)
-        ]
-
-    simulators = [
-        oi.PCMSimulator(
-            convert_to_analog(model, rpu_config=rpu_config).to(device),
-            weights,
-            scales,
-            noise,
-            compensation,
-        )
-        for _ in range(n_realizations)
-    ]
-
-    ensemble = oi.PCMEnsemble(pairs, simulators, t_inferences)
-    ensemble.eval()
-
-    optimizer = torch.optim.Adam(
-        list(ensemble.g_plus) + list(ensemble.g_minus),
-        lr=0.01,
+    oi_model = oi.convert_to_oi(
+        analog_model,
+        n_realizations=n_realizations + n_evaluation_realizations,
+        n_times=len(t_inferences),
     )
+    oi_model.eval()
+
+    tiles = [
+        module for module in oi_model.modules()
+        if isinstance(module, oi.OITile)
+    ]
+
+    conductances = [
+        g
+        for tile in tiles
+        for side in (tile.g_plus, tile.g_minus)
+        for g in side
+    ]
+    optimizer = torch.optim.Adam(conductances, lr=0.01)
 
     history = []
 
     log_interval = 10
     for epoch in range(1, 2):
         start = perf_counter()
-        loss, accuracy = train_oi_epoch(ensemble, device, train_loader,
-                                        optimizer, epoch, log_interval)
+        loss, accuracy = train_oi_epoch(model, n_realizations, t_inferences,
+                                        device, train_loader,
+                                        optimizer, log_interval)
         end = perf_counter()
         history.append({"loss": loss, "accuracy": accuracy})
 
@@ -373,14 +272,17 @@ def main():
             f"Epoch {epoch}: loss={loss:.4f}, "
             f"accuracy={100 * accuracy:.2f}%, "
             f"time taken {end - start}, "
-            f"evaluation={evaluate_oi(ensemble, device, test_loader)}"
+            f"evaluation={evaluate_oi(
+                              oi_model, n_realizations,
+                              n_evaluation_realizations, t_inferences,
+                              device, test_loader
+                          )}"
         )
 
-    for t in t_inferences:
-        for realization in range(n_realizations):
-            stock_model = make_stock_realization(
-                model, ensemble, rpu_config, t, device
-            )
+    for realization in range(n_realizations + n_evaluation_realizations):
+        for t_i, t in enumerate(t_inferences):
+            oi.program_weights(oi_model, realization, t_i, t)
+            stock_model = oi.oi_to_analog(oi_model)
             print(f"Stock evaluation: time={t}, realization={realization}")
             test(stock_model, device, test_loader)
 

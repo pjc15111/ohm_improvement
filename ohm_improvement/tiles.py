@@ -238,7 +238,7 @@ class OITile(nn.Module):
         if self.compensation is not None:
             probe = self.compensation.get_readout_tensor(
                 self.tile.tile.in_size
-            ).to(self.tile.active_weights)
+            ).to(self.active_weights)
             probe_output = self.analog_forward(probe)
             output = self.compensation.apply(
                 probe_output, self.reference, output
@@ -251,6 +251,12 @@ class OITile(nn.Module):
         if self.digital_bias:
             return out + self.bias.view(*tensor_view)
         return out
+
+    @torch.no_grad()
+    def clamp_conductances(self) -> None:
+        for side in (self.g_plus, self.g_minus):
+            for g in side:
+                g.clamp_(self.g_converter.g_min, self.g_converter.g_max)
 
     def to_analog(self):
         if self.active_weights is None:

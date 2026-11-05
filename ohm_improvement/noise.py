@@ -1,7 +1,7 @@
 from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.inference.converter.conductance import SinglePairConductanceConverter
 
-from aihwkit.simulator.noise_models import PCMLikeNoiseModel
+from aihwkit.inference import PCMLikeNoiseModel
 
 import numpy as np
 import torch
@@ -235,8 +235,20 @@ def convert_noise_model(noise_model):
     if noise_model is None:
         return None
 
+    noise_model = deepcopy(noise_model)
+
     if type(noise_model) is PCMLikeNoiseModel:
-        return DifferentiablePCMLikeNoiseModel()
+        return DifferentiablePCMLikeNoiseModel(
+            noise_model.prog_coeff,
+            noise_model.g_converter,
+            noise_model.g_max,
+            noise_model.t_read,
+            noise_model.t_0,
+            noise_model.prog_noise_scale,
+            noise_model.read_noise_scale,
+            noise_model.drift_scale,
+            noise_model.prog_coeff_g_max_reference
+        )
 
     raise TypeError(
         f"Unsupported drift compensation: {type(noise_model).__name__}"

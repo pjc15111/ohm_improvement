@@ -50,6 +50,18 @@ def convert_to_oi(
     return module
 
 
+def oi_to_analog(model, inplace=False):    
+    if not inplace:
+        model = deepcopy(model)
+
+    if model.__class__ == OITile:
+        model = model.to_analog()
+
+    for name, mod in model.named_children():
+        model._modules[name] = oi_to_analog(mod, inplace=True)
+
+    return model
+
 def program_weights(
     model: nn.Module,
     realization_index: int,
@@ -64,3 +76,8 @@ def program_weights(
                 time_index,
                 time,
             )
+
+def clamp_conductances(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, OITile):
+            module.clamp_conductances()
