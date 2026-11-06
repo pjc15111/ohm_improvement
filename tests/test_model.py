@@ -182,3 +182,37 @@ def test_inplace_export_preserves_outer_model_identity():
 
     assert exported is model
     assert not oi_tiles(model)
+
+
+def test_model_noise_seeds_are_reproducible_and_distinct_per_tile():
+    seeds = dict(train=11, validation=22, evaluation=33)
+    analog = make_model()
+    rng = torch.random.get_rng_state().clone()
+    first = convert_to_oi(analog, 2, [0., 86400.], noise_seeds=seeds)
+    second = convert_to_oi(analog, 2, [0., 86400.], noise_seeds=seeds)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    tiles = oi_tiles(first)
+    assert not torch.equal(tiles[0].noise_seeds, tiles[1].noise_seeds)
+    for a, b in zip(tiles, oi_tiles(second)):
+        torch.testing.assert_close(a.noise_seeds, b.noise_seeds)
+    program_weights(first, 0, 0, noise_split="validation")
+    with pytest.raises(ValueError, match="split"):
+        program_weights(first, 0, 0, noise_split="typo")
+
+
+@pytest.mark.parametrize("seeds", [dict(train=1, validation=1, evaluation=2),
+                                   dict(train=-1, validation=2, evaluation=3),
+                                   dict(train=1)])
+def test_invalid_noise_seeds(seeds):
+    with pytest.raises(ValueError):
+        convert_to_oi(make_model(), 1, [0.], noise_seeds=seeds)
+
+
+def test_default_noise_seeds_follow_manual_seed():
+    analog = make_model()
+    torch.manual_seed(123)
+    first = convert_to_oi(analog, 1, [0.])
+    torch.manual_seed(123)
+    second = convert_to_oi(analog, 1, [0.])
+    for a, b in zip(oi_tiles(first), oi_tiles(second)):
+        torch.testing.assert_close(a.noise_seeds, b.noise_seeds)

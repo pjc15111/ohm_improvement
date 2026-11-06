@@ -4,6 +4,8 @@ from aihwkit.simulator.tiles.inference import (
 from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.simulator.tiles.functions import AnalogFunction
 
+import hashlib
+
 import torch.nn as nn
 
 import torch
@@ -33,7 +35,9 @@ class OITile(nn.Module):
         n_realizations: int,
         t_inferences: List[float],
         g_converter: Optional[BaseConductanceConverter],
-        train_significance = True
+        train_significance = True,
+        *,
+        noise_seeds,
     ):
         nn.Module.__init__(self)
 
@@ -75,7 +79,7 @@ class OITile(nn.Module):
 
         self.tile = TileHolder(tile)
         self.init_conductances(train_significance, g_converter)
-        self.init_noise(n_realizations, len(t_inferences))
+        self.init_noise(n_realizations, len(t_inferences), noise_seeds)
 
     def init_conductances(
         self,
@@ -130,37 +134,39 @@ class OITile(nn.Module):
         )
         self.register_buffer("scale", mapping.scale.detach().clone())
 
-    def init_noise(self, n_realizations: int, n_times: int) -> None:
-        """Sample fixed randomness for programming, drift, and read noise."""
+    def init_noise(self, n_realizations: int, n_times: int, noise_seeds) -> None:
+        """Store seeds already initialized and validated by convert_to_oi.
+
+        Direct OITile callers must supply valid train/validation/evaluation seeds.
+        """
         if n_realizations < 1 or n_times < 1:
             raise ValueError("n_realizations and n_times must be positive")
-
         self.n_realizations = n_realizations
+        self.register_buffer("noise_seeds", torch.tensor(
+            [noise_seeds[name] for name in ("train", "validation", "evaluation")],
+            dtype=torch.int64,
+        ))
 
-        n_pairs = len(self.g_plus)
-        g = self.g_plus[0]
+    def noise_sample(self, kind, pair, side, realization, time_index=0,
+                     noise_split="train"):
+        """Return fixed randomness without touching the global RNG.
 
-        # Dimensions: [pair, side, realization, *conductance_shape].
-        # Side 0 is positive; side 1 is negative.
-        shape = (n_pairs, 2, n_realizations, *g.shape)
-
-        self.register_buffer(
-            "prog_noise",
-            torch.randn(shape, device=g.device, dtype=g.dtype),
-        )
-        self.register_buffer(
-            "drift_noise",
-            torch.randn(shape, device=g.device, dtype=g.dtype),
-        )
-
-        # Read noise is independent at each timestamp.
-        # Dimensions: [pair, side, realization, time, *conductance_shape].
-        read_shape = (n_pairs, 2, n_realizations, n_times, *g.shape)
-
-        self.register_buffer(
-            "read_noise",
-            torch.randn(read_shape, device=g.device, dtype=g.dtype),
-        )
+        Programming and drift samples are shared across timestamps. Read samples
+        are keyed by elapsed time, independent of evaluation order or time grid.
+        Reproducibility is within a device/backend and dtype, not across CPU/CUDA.
+        """
+        names = ("train", "validation", "evaluation")
+        if noise_split not in names:
+            raise ValueError(f"Unknown noise split: {noise_split}")
+        if kind not in ("program", "drift", "read"):
+            raise ValueError(f"Unknown noise kind: {kind}")
+        seed = int(self.noise_seeds[names.index(noise_split)].item())
+        timestamp = float(self.t_inferences[time_index]).hex() if kind == "read" else ""
+        key = f"{seed}:{kind}:{pair}:{side}:{realization}:{timestamp}"
+        derived = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "little")
+        g = self.g_plus[pair]
+        generator = torch.Generator(device=g.device).manual_seed(derived)
+        return torch.randn(g.shape, generator=generator, device=g.device, dtype=g.dtype)
 
     def apply_out_scaling(self, values, tensor_view):
         if self.out_scaling_alpha is not None:
@@ -193,12 +199,15 @@ class OITile(nn.Module):
     def program_weights(
         self,
         realization_index: int,
-        time_index: int
+        time_index: int,
+        noise_split: str = "train",
     ) -> None:
         if not 0 <= realization_index < self.n_realizations:
             raise IndexError("realization_index out of range")
         if not 0 <= time_index < len(self.t_inferences):
             raise IndexError("time_index out of range")
+        if noise_split not in ("train", "validation", "evaluation"):
+            raise ValueError(f"Unknown noise split: {noise_split}")
         time = self.t_inferences[time_index]
         if time < 0:
             raise ValueError("time must be nonnegative")
@@ -214,13 +223,13 @@ class OITile(nn.Module):
                 programmed[side].append(
                     self.noise_model.apply_programming_noise_to_conductance(
                         g_target,
-                        self.prog_noise[p, side, r],
+                        self.noise_sample("program", p, side, r, t, noise_split),
                     )
                 )
                 drift_coefficients[side].append(
                     self.noise_model.generate_drift_coefficients(
                         g_target,
-                        self.drift_noise[p, side, r],
+                        self.noise_sample("drift", p, side, r, t, noise_split),
                     )
                 )
 
@@ -243,7 +252,7 @@ class OITile(nn.Module):
                         g_prog,
                         nu,
                         time,
-                        self.read_noise[p, side, r, t],
+                        self.noise_sample("read", p, side, r, t, noise_split),
                     )
                 )
 

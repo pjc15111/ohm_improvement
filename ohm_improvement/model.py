@@ -3,6 +3,8 @@ from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.simulator.tiles.inference import (
     InferenceTile
 )
+import hashlib
+
 import torch.nn as nn
 import torch
 
@@ -18,35 +20,38 @@ def convert_to_oi(
     t_inferences: List[float],
     inplace: bool = False,
     g_converter: Optional[BaseConductanceConverter] = None,
+    noise_seeds=None,
 ) -> nn.Module:
-    CONVERSION_MAP = {
-        InferenceTile: OITile
-    }
+    if noise_seeds is None:
+        noise_seeds = dict(zip(
+            ("train", "validation", "evaluation"),
+            torch.randint(0, 2**63 - 1, (3,), dtype=torch.int64).tolist(),
+        ))
+    elif (set(noise_seeds) != {"train", "validation", "evaluation"}
+            or any(type(s) is not int or not 0 <= s < 2**63
+                   for s in noise_seeds.values())
+            or len(set(noise_seeds.values())) != 3):
+        raise ValueError("noise_seeds requires three distinct integer seeds in [0, 2**63)")
 
     if not inplace:
         module = deepcopy(module)
 
-    if module.__class__ in CONVERSION_MAP:
-        module = CONVERSION_MAP[module.__class__](
-            module,
-            n_realizations,
-            t_inferences,
-            g_converter
-        )
+    # Use stable module paths so same-shaped tiles have independent streams.
+    def convert(child, path):
+        if child.__class__ is InferenceTile:
+            tile_seeds = {
+                name: int.from_bytes(hashlib.blake2b(
+                    f"{seed}:{path}".encode(), digest_size=8
+                ).digest(), "little") % (2**63)
+                for name, seed in noise_seeds.items()
+            }
+            return OITile(child, n_realizations, t_inferences, g_converter,
+                          noise_seeds=tile_seeds)
+        for name, grandchild in child.named_children():
+            child._modules[name] = convert(grandchild, f"{path}.{name}")
+        return child
 
-    # named_children() suppresses duplicate references, returning each
-    # child only once. So duplicate references will wind up referring
-    # to different objects. But we only get to this method after going
-    # through  convert_to_analog first, which has the same bug, so we
-    # do no additional harm.
-    for name, mod in module.named_children():
-        module._modules[name] = convert_to_oi(
-            mod,
-            n_realizations,
-            t_inferences,
-            inplace=True,
-            g_converter=g_converter
-        )
+    module = convert(module, "")
 
     return module
 
@@ -74,14 +79,16 @@ def oi_to_analog(model, inplace=False):
 def program_weights(
     model: nn.Module,
     realization_index: int,
-    time_index: int
+    time_index: int,
+    noise_split: str = "train",
 ) -> None:
     """Apply one realization and timestamp to every OITile."""
     for module in model.modules():
         if isinstance(module, OITile):
             module.program_weights(
                 realization_index,
-                time_index
+                time_index,
+                noise_split=noise_split,
             )
 
 

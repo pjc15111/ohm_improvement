@@ -125,14 +125,14 @@ def train_oi_epoch(oi_model, realizations, t_inferences, device,
 
 @torch.no_grad()
 def evaluate_oi(oi_model, realizations,
-                t_inferences, device, test_loader):
+                t_inferences, device, test_loader, noise_split="evaluation"):
     total_loss = 0.0
     total_correct = 0
     total_predictions = 0
 
     for realization in realizations:
         for t_i in range(len(t_inferences)):
-            oi.program_weights(oi_model, realization, t_i)
+            oi.program_weights(oi_model, realization, t_i, noise_split=noise_split)
             for x, target in test_loader:
                 x, target = x.to(device), target.to(device)
                 output = oi_model(x)
@@ -176,7 +176,16 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', 
                         help='For Saving the current Model')
+    parser.add_argument('--train-noise-seed', type=int, default=101)
+    parser.add_argument('--validation-noise-seed', type=int, default=202)
+    parser.add_argument('--evaluation-noise-seed', type=int, default=303)
     args = parser.parse_args()
+    noise_seeds = dict(train=args.train_noise_seed,
+                       validation=args.validation_noise_seed,
+                       evaluation=args.evaluation_noise_seed)
+    if len(set(noise_seeds.values())) != 3 or any(
+            not 0 <= seed < 2**63 for seed in noise_seeds.values()):
+        parser.error('noise seeds must be distinct integers in [0, 2**63)')
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
@@ -240,7 +249,8 @@ def main():
     oi_model = oi.convert_to_oi(
         analog_model,
         n_realizations=n_realizations + n_evaluation_realizations,
-        t_inferences=t_inferences
+        t_inferences=t_inferences,
+        noise_seeds=noise_seeds,
     )
     oi_model.eval()
 
@@ -278,7 +288,8 @@ def main():
 
     for realization in range(n_realizations + n_evaluation_realizations):
         for t_i in range(len(t_inferences)):
-            oi.program_weights(oi_model, realization, t_i)
+            noise_split = "train" if realization < n_realizations else "evaluation"
+            oi.program_weights(oi_model, realization, t_i, noise_split=noise_split)
             stock_model = oi.oi_to_analog(oi_model)
             print(f"Stock evaluation: time={t_inferences[t_i]}, realization={realization}")
             test(stock_model, device, test_loader)

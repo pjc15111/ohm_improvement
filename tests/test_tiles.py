@@ -51,7 +51,7 @@ def test_initialization_preserves_backend_weights(device, compensation):
     raw, _ = original.get_weights(apply_weight_scaling=False)
     assert raw.abs().max() > 0
 
-    wrapped = OITile(deepcopy(original), 2, [0.0, 86400.0], None)
+    wrapped = OITile(deepcopy(original), 2, [0.0, 86400.0], None, noise_seeds=dict(train=11, validation=22, evaluation=33))
     wrapped.eval()
     wrapped.program_weights(0, 0)
 
@@ -72,7 +72,7 @@ def test_initialization_preserves_backend_weights(device, compensation):
 
 
 def test_gradients_reach_every_pair_and_significance(device):
-    wrapped = OITile(make_tile(device), 1, [0.0], None)
+    wrapped = OITile(make_tile(device), 1, [0.0], None, noise_seeds=dict(train=11, validation=22, evaluation=33))
     wrapped.eval()
     wrapped.program_weights(0, 0)
 
@@ -89,7 +89,7 @@ def test_gradients_reach_every_pair_and_significance(device):
 
 
 def test_clamping_preserves_parameters_and_enforces_bounds(device):
-    wrapped = OITile(make_tile(device), 1, [0.0], None)
+    wrapped = OITile(make_tile(device), 1, [0.0], None, noise_seeds=dict(train=11, validation=22, evaluation=33))
     parameters = [*wrapped.g_plus, *wrapped.g_minus, wrapped.significance]
     identities = [id(p) for p in parameters]
 
@@ -121,6 +121,7 @@ def test_export_matches_snapshot_and_is_independent(device, compensation):
         2,
         [0.0, 86400.0],
         None,
+        noise_seeds=dict(train=11, validation=22, evaluation=33),
     )
     wrapped.eval()
     with torch.no_grad():
@@ -156,6 +157,7 @@ def test_accumulated_and_immediate_backward_agree(device):
         2,
         [0.0, 86400.0],
         None,
+        noise_seeds=dict(train=11, validation=22, evaluation=33),
     )
     wrapped.eval()
     parameters = [*wrapped.g_plus, *wrapped.g_minus, wrapped.significance]
@@ -193,7 +195,7 @@ def test_accumulated_and_immediate_backward_agree(device):
 
 
 def test_programming_validates_indices_and_requires_preparation():
-    wrapped = OITile(make_tile(torch.device("cpu")), 2, [0.0], None)
+    wrapped = OITile(make_tile(torch.device("cpu")), 2, [0.0], None, noise_seeds=dict(train=11, validation=22, evaluation=33))
 
     with pytest.raises(RuntimeError, match="program_weights"):
         wrapped(torch.ones(1, 3))
@@ -203,3 +205,41 @@ def test_programming_validates_indices_and_requires_preparation():
         wrapped.program_weights(2, 0)
     with pytest.raises(IndexError):
         wrapped.program_weights(0, 1)
+
+
+def test_seeded_noise_streams_and_checkpoint(device):
+    seeds = dict(train=11, validation=22, evaluation=33)
+    wrapped = OITile(make_tile(device, noisy=True), 3, [0., 86400.], None,
+                     noise_seeds=seeds)
+    rng = torch.random.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state() if device.type == "cuda" else None
+    sample = wrapped.noise_sample("program", 0, 0, 0)
+    # Time and call order do not change programming/drift randomness.
+    for kind in ("program", "drift"):
+        torch.testing.assert_close(wrapped.noise_sample(kind, 0, 0, 0, 0),
+                                   wrapped.noise_sample(kind, 0, 0, 0, 1), rtol=0, atol=0)
+    others = [
+        wrapped.noise_sample("program", 0, 0, 0, noise_split=split)
+        for split in ("validation", "evaluation")
+    ] + [wrapped.noise_sample("program", 1, 0, 0),
+         wrapped.noise_sample("program", 0, 1, 0),
+         wrapped.noise_sample("program", 0, 0, 1),
+         wrapped.noise_sample("drift", 0, 0, 0)]
+    assert all(not torch.equal(sample, other) for other in others)
+    assert not torch.equal(wrapped.noise_sample("read", 0, 0, 0, 0),
+                           wrapped.noise_sample("read", 0, 0, 0, 1))
+    assert torch.equal(rng, torch.random.get_rng_state())
+    if cuda_rng is not None:
+        assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
+
+    wrapped.program_weights(1, 1, noise_split="evaluation")
+    expected = wrapped.active_weights.detach().clone()
+    restored = OITile(make_tile(device, noisy=True), 3, [0., 86400.], None, noise_seeds=dict(train=11, validation=22, evaluation=33))
+    restored.load_state_dict(wrapped.state_dict())
+    restored.program_weights(1, 1, noise_split="evaluation")
+    torch.testing.assert_close(restored.active_weights, expected, rtol=0, atol=0)
+    # Storage is constant in realization/time count, and samples stay out of checkpoints.
+    assert set(wrapped._buffers) == {"scale", "noise_seeds"}
+    wrapped.active_weights.square().sum().backward()
+    for g in [*wrapped.g_plus, *wrapped.g_minus]:
+        assert g.grad is not None and torch.isfinite(g.grad).all()
