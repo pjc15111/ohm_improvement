@@ -57,25 +57,29 @@ def test_conversion_matches_stock_and_round_trips(
         weights.zero_()
 
     mapping = convert_to_conductances(converter, weights)
+    # The stock custom converter is CPU-only; compare its result after transfer.
+    reference_weights = weights.cpu() if isinstance(
+        converter, CustomPairConductanceConverter
+    ) else weights
     stock_conductances, stock_params = converter.convert_to_conductances(
-        weights
+        reference_weights
     )
 
     assert len(mapping.g_plus) == len(stock_conductances) // 2
     assert len(mapping.g_minus) == len(mapping.g_plus)
 
     for actual, expected in zip(mapping.g_plus, stock_conductances[::2]):
-        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual, expected.to(weights))
 
     for actual, expected in zip(mapping.g_minus, stock_conductances[1::2]):
-        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual, expected.to(weights))
 
     expected_factors = getattr(converter, "f_lst", [1.0])
     torch.testing.assert_close(
         mapping.significance,
         weights.new_tensor(expected_factors),
     )
-    torch.testing.assert_close(mapping.scale, stock_params["scale_ratio"])
+    torch.testing.assert_close(mapping.scale, stock_params["scale_ratio"].to(weights))
     torch.testing.assert_close(convert_back_to_weights(mapping), weights)
 
     for tensor in [

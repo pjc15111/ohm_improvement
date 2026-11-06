@@ -115,6 +115,10 @@ class OITile(nn.Module):
 
         # Mutable backend holder, never passed as the autograd weight argument.
         tile.shared_weights = weights.detach().clone()
+        # CUDA's first shared-weight binding copies backend weights into the
+        # supplied tensor. Complete it using the disposable holder, before any
+        # differentiable programmed/drifted weights are passed to AnalogFunction.
+        tile.ensure_shared_weights()
 
         # Set by install_conductances().
         self.active_weights = None

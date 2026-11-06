@@ -1,4 +1,5 @@
 from aihwkit.inference.converter.base import BaseConductanceConverter
+from aihwkit.inference.converter.conductance import CustomPairConductanceConverter
 
 import torch
 from torch import Tensor
@@ -18,13 +19,19 @@ def convert_to_conductances(
     converter: BaseConductanceConverter,
     weights: Tensor
 ) -> ConductanceMapping:
-    conductances, params = converter.convert_to_conductances(weights)
+    # AIHWKIT's custom converter interpolates through NumPy and currently mixes
+    # CPU linspace with CUDA scalars. Initialization can run on CPU once.
+    conversion_weights = weights.cpu() if isinstance(
+        converter, CustomPairConductanceConverter
+    ) else weights
+    conductances, params = converter.convert_to_conductances(conversion_weights)
+    conductances = [g.to(weights) for g in conductances]
 
     return ConductanceMapping(
         g_plus=conductances[::2],
         g_minus=conductances[1::2],
         significance=weights.new_tensor(params.get("f_lst", [1.0])),
-        scale=params["scale_ratio"].detach().clone(),
+        scale=params["scale_ratio"].detach().to(weights).clone(),
     )
 
 

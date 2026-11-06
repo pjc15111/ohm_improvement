@@ -276,11 +276,11 @@ def test_custom_converter_initialization_and_gradients(device):
     native_weights = raw.to(device)
     if device.type == "cuda":
         native_weights = native_weights.T
-    conductances, _ = converter.convert_to_conductances(native_weights)
+    conductances, _ = converter.convert_to_conductances(native_weights.cpu())
     wrapped = OITile(original, 1, [0.], converter,
                      noise_seeds=dict(train=11, validation=22, evaluation=33))
-    torch.testing.assert_close(wrapped.g_plus[0], conductances[0])
-    torch.testing.assert_close(wrapped.g_minus[0], conductances[1])
+    torch.testing.assert_close(wrapped.g_plus[0], conductances[0].to(device))
+    torch.testing.assert_close(wrapped.g_minus[0], conductances[1].to(device))
     wrapped.program_weights(0, 0)
     torch.testing.assert_close(wrapped.active_weights, native_weights)
     wrapped(torch.tensor([[0.2, -0.4, 0.8]], device=device)).square().sum().backward()
@@ -288,3 +288,34 @@ def test_custom_converter_initialization_and_gradients(device):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
         assert parameter.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("compensation", [False, True])
+def test_first_backend_binding_does_not_overwrite_programmed_weights(monkeypatch, compensation):
+    tile = make_tile(torch.device("cpu"), compensation=compensation, noisy=True)
+    backend_weights = tile.get_weights(apply_weight_scaling=False)[0].clone()
+    original_ensure = tile.ensure_shared_weights
+    first_binding = True
+
+    def lazy_cuda_binding(shared_weights=None):
+        # Reproduce CUDA's destructive first binding on CPU so this regression
+        # can also be exercised without a GPU.
+        nonlocal first_binding
+        if first_binding:
+            destination = tile.shared_weights if shared_weights is None else shared_weights
+            with torch.no_grad():
+                destination.copy_(backend_weights)
+            first_binding = False
+        original_ensure(shared_weights)
+
+    monkeypatch.setattr(tile, "ensure_shared_weights", lazy_cuda_binding)
+    wrapped = OITile(tile, 1, [86400.], None,
+                     noise_seeds=dict(train=11, validation=22, evaluation=33))
+    assert not first_binding
+    wrapped.program_weights(0, 0)
+    expected = wrapped.active_weights.detach().clone()
+    x = torch.tensor([[0.2, -0.4, 0.8]])
+    first = wrapped(x)
+    torch.testing.assert_close(wrapped.active_weights, expected, rtol=0, atol=0)
+    wrapped.program_weights(0, 0)
+    torch.testing.assert_close(wrapped(x), first, rtol=0, atol=0)
