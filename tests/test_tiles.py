@@ -5,7 +5,9 @@ import torch
 from torch import nn
 
 from aihwkit.inference.compensation.drift import GlobalDriftCompensation
-from aihwkit.inference.converter.conductance import NPairConductanceConverter
+from aihwkit.inference.converter.conductance import (
+    NPairConductanceConverter, CustomPairConductanceConverter,
+)
 from aihwkit.simulator import rpu_base
 from aihwkit.simulator.configs import InferenceRPUConfig
 from aihwkit.simulator.tiles.inference import InferenceTile
@@ -150,10 +152,11 @@ def test_export_matches_snapshot_and_is_independent(device, compensation):
     torch.testing.assert_close(wrapped(x), expected, atol=2e-6, rtol=2e-5)
 
 
-def test_accumulated_and_immediate_backward_agree(device):
+@pytest.mark.parametrize("compensation", [False, True])
+def test_accumulated_and_immediate_backward_agree(device, compensation):
     # Forward noise is disabled, but the fixed PCM samples remain active.
     wrapped = OITile(
-        make_tile(device, compensation=True, noisy=True),
+        make_tile(device, compensation=compensation, noisy=True),
         2,
         [0.0, 86400.0],
         None,
@@ -168,13 +171,16 @@ def test_accumulated_and_immediate_backward_agree(device):
             [[0.2, -0.4, 0.8]], device=device, requires_grad=True
         )
         losses = []
+        snapshots = []
         for r, t in [(0, 0), (1, 1)]:
             wrapped.program_weights(r, t)
+            snapshots.append(wrapped.active_weights.detach().clone())
             # Reuse one programmed tile twice within a graph as well.
             loss = (
                 wrapped(x).square().mean()
                 + wrapped(0.7 * x).square().mean()
             ) / 2
+            snapshots.append(loss.detach().clone())
             if accumulate:
                 losses.append(loss)
             else:
@@ -183,15 +189,30 @@ def test_accumulated_and_immediate_backward_agree(device):
         if accumulate:
             sum(losses).backward()
 
-        return [p.grad.detach().clone() for p in parameters] + [
+        return snapshots, [p.grad.detach().clone() for p in parameters] + [
             x.grad.detach().clone()
         ]
 
-    accumulated = gradients(True)
-    immediate = gradients(False)
+    accumulated_forward, accumulated = gradients(True)
+    immediate_forward, immediate = gradients(False)
 
-    for actual, expected in zip(accumulated, immediate):
-        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-4)
+    for index, (actual, expected) in enumerate(zip(accumulated_forward, immediate_forward)):
+        torch.testing.assert_close(
+            actual, expected, atol=2e-6, rtol=2e-4,
+            msg=lambda message: f"Forward snapshot {index}: {message}",
+        )
+    names = [f"g_plus[{i}]" for i in range(len(wrapped.g_plus))]
+    names += [f"g_minus[{i}]" for i in range(len(wrapped.g_minus))]
+    names += ["significance", "input"]
+    for name, actual, expected in zip(names, accumulated, immediate):
+        torch.testing.assert_close(
+            actual, expected, atol=2e-6, rtol=2e-4,
+            msg=lambda message, name=name: (
+                f"{name} gradient (compensation={compensation}): {message}\n"
+                f"Accumulated: {actual.detach().cpu().tolist()}\n"
+                f"Immediate: {expected.detach().cpu().tolist()}"
+            ),
+        )
 
 
 def test_programming_validates_indices_and_requires_preparation():
@@ -243,3 +264,27 @@ def test_seeded_noise_streams_and_checkpoint(device):
     wrapped.active_weights.square().sum().backward()
     for g in [*wrapped.g_plus, *wrapped.g_minus]:
         assert g.grad is not None and torch.isfinite(g.grad).all()
+
+
+def test_custom_converter_initialization_and_gradients(device):
+    original = make_tile(device)
+    converter = CustomPairConductanceConverter(
+        f_lst=[2.0], g_min=1., g_max=25.,
+        g_lst=[[5., 10., 25.], [25., 10., 5.]],
+    )
+    raw, _ = original.get_weights(apply_weight_scaling=False)
+    native_weights = raw.to(device)
+    if device.type == "cuda":
+        native_weights = native_weights.T
+    conductances, _ = converter.convert_to_conductances(native_weights)
+    wrapped = OITile(original, 1, [0.], converter,
+                     noise_seeds=dict(train=11, validation=22, evaluation=33))
+    torch.testing.assert_close(wrapped.g_plus[0], conductances[0])
+    torch.testing.assert_close(wrapped.g_minus[0], conductances[1])
+    wrapped.program_weights(0, 0)
+    torch.testing.assert_close(wrapped.active_weights, native_weights)
+    wrapped(torch.tensor([[0.2, -0.4, 0.8]], device=device)).square().sum().backward()
+    for parameter in [*wrapped.g_plus, *wrapped.g_minus, wrapped.significance]:
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0

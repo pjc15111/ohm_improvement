@@ -5,6 +5,7 @@ from aihwkit.inference.converter.conductance import (
     SinglePairConductanceConverter,
     DualPairConductanceConverter,
     NPairConductanceConverter,
+    CustomPairConductanceConverter,
 )
 
 from ohm_improvement.conductance import (
@@ -25,6 +26,15 @@ def device(request):
     "converter",
     [
         SinglePairConductanceConverter(g_min=0.0, g_max=25.0),
+        CustomPairConductanceConverter(
+            f_lst=[1.0], g_min=1.0, g_max=25.0,
+            g_lst=[[5.0, 10.0, 25.0], [25.0, 10.0, 5.0]],
+        ),
+        CustomPairConductanceConverter(
+            f_lst=[1.0, 2.0], g_min=1.0, g_max=25.0,
+            g_lst=[[3., 6., 10., 15., 21.], [11., 10., 10., 11., 13.],
+                   [4., 7., 9., 12., 16.], [8., 9., 9., 10., 12.]],
+        ),
         SinglePairConductanceConverter(g_min=1.0, g_max=25.0),
         DualPairConductanceConverter(
             f_lst=[1.0, 2.0], g_min=0.0, g_max=25.0
@@ -118,9 +128,22 @@ def test_reconstruction_rejects_mismatched_pairs(case):
         convert_back_to_weights(mapping)
 
 
-def test_unknown_subclass_is_not_silently_accepted():
-    class UnsupportedConverter(SinglePairConductanceConverter):
+def test_converter_subclass_is_delegated_to():
+    class ConverterSubclass(SinglePairConductanceConverter):
         pass
 
-    with pytest.raises(NotImplementedError):
-        convert_to_conductances(UnsupportedConverter(), torch.ones(2, 3))
+    weights = torch.tensor([[-1., 0., 1.]])
+    mapping = convert_to_conductances(ConverterSubclass(), weights)
+    torch.testing.assert_close(convert_back_to_weights(mapping), weights)
+
+
+def test_custom_mapping_preserves_nonzero_common_mode(device):
+    converter = CustomPairConductanceConverter(
+        f_lst=[2.0], g_min=1., g_max=25.,
+        g_lst=[[5., 10., 25.], [25., 10., 5.]],
+    )
+    weights = torch.tensor([[-1., -0.5, 0., 0.5, 1.]], device=device)
+    mapping = convert_to_conductances(converter, weights)
+    torch.testing.assert_close(mapping.g_plus[0], weights.new_tensor([[5., 7.5, 10., 17.5, 25.]]))
+    torch.testing.assert_close(mapping.g_minus[0], weights.new_tensor([[25., 17.5, 10., 7.5, 5.]]))
+    torch.testing.assert_close(convert_back_to_weights(mapping), weights)
