@@ -1,9 +1,2 @@
-from .model import (
-    convert_to_oi,
-    program_weights,
-    clamp_conductances,
-    oi_to_analog,
-    optimization_parameters,
-    clamp_model
-)
+from .model import OIModel, AnalogModel
 from .tiles import OITile

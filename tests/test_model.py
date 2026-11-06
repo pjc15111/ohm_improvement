@@ -7,14 +7,13 @@ from aihwkit.inference.compensation.drift import GlobalDriftCompensation
 from aihwkit.inference.converter.conductance import NPairConductanceConverter
 from aihwkit.simulator.configs import InferenceRPUConfig
 
-from ohm_improvement.model import (
-    convert_to_oi,
-    oi_to_analog,
-    program_weights,
-    optimization_parameters,
-    clamp_model,
-)
+from ohm_improvement.model import OIModel, AnalogModel
 from ohm_improvement.tiles import OITile
+
+
+def prepare(model: OIModel, realization_id: str, time: float):
+    model.program(realization_id)
+    model.drift(time)
 
 
 def make_model(bias=True, scaling=True):
@@ -46,14 +45,14 @@ def oi_tiles(model):
 
 def test_nested_conversion_and_model_programming():
     original = make_model()
-    converted = convert_to_oi(original, 2, [0.0, 86400.0]).eval()
+    converted = OIModel(original).eval()
 
     assert converted is not original
     assert len(oi_tiles(converted)) == 2
     assert not oi_tiles(original)
     assert all(tile.active_weights is None for tile in oi_tiles(converted))
 
-    program_weights(converted, 1, 1)
+    prepare(converted, "train1", 86400.0)
     assert all(tile.active_weights is not None for tile in oi_tiles(converted))
 
     x = torch.tensor([[0.2, -0.3, 0.8], [-0.1, 0.7, 0.4]])
@@ -68,7 +67,7 @@ def test_nested_conversion_and_model_programming():
      "include_bias", "include_significance"],
 )
 def test_parameter_selection_returns_exact_group(option):
-    model = convert_to_oi(make_model(), 1, [0.0])
+    model = OIModel(make_model())
     tiles = oi_tiles(model)
     options = {
         "include_conductances": False,
@@ -93,27 +92,21 @@ def test_parameter_selection_returns_exact_group(option):
     else:
         expected = [tile.significance for tile in tiles]
 
-    actual = optimization_parameters(model, **options)
+    actual = model.optimization_parameters(**options)
     assert len(actual) == 1
     assert actual[0]["name"] == option.removeprefix("include_")
     assert [id(p) for p in actual[0]["params"]] == [id(p) for p in expected]
 
 
 def test_absent_optional_parameters_are_not_returned():
-    model = convert_to_oi(make_model(bias=False, scaling=False), 1, [0.0])
+    model = OIModel(make_model(bias=False, scaling=False))
 
-    actual = optimization_parameters(
-        model,
-        include_conductances=False,
-        include_output_scaling=True,
-        include_bias=True,
-        include_significance=False,
-    )
+    actual = model.optimization_parameters(include_conductances=False, include_output_scaling=True, include_bias=True, include_significance=False)
     assert actual == []
 
 
 def test_model_clamping_reaches_every_tile():
-    model = convert_to_oi(make_model(), 1, [0.0])
+    model = OIModel(make_model())
     with torch.no_grad():
         for tile in oi_tiles(model):
             for g in tile.g_plus:
@@ -122,7 +115,7 @@ def test_model_clamping_reaches_every_tile():
                 g.fill_(100.0)
             tile.significance.fill_(9.0)
 
-    clamp_model(model)
+    model.clamp()
 
     for tile in oi_tiles(model):
         for g in tile.g_plus:
@@ -139,8 +132,8 @@ def test_model_clamping_reaches_every_tile():
 
 
 def test_export_does_not_copy_graphs_or_mutate_original():
-    model = convert_to_oi(make_model(), 1, [0.0]).eval()
-    program_weights(model, 0, 0)
+    model = OIModel(make_model()).eval()
+    prepare(model, "train1", 0.0)
     tiles = oi_tiles(model)
 
     # Export must work with live non-leaf tensors on the OITiles.
@@ -149,7 +142,7 @@ def test_export_does_not_copy_graphs_or_mutate_original():
 
     x = torch.tensor([[0.2, -0.3, 0.8]])
     expected = model(x).detach().clone()
-    exported = oi_to_analog(model)
+    exported = model.to_analog()
 
     assert exported is not model
     assert not oi_tiles(exported)
@@ -176,56 +169,54 @@ def test_export_does_not_copy_graphs_or_mutate_original():
     )
 
 
-def test_inplace_export_preserves_outer_model_identity():
-    model = convert_to_oi(make_model(), 1, [0.0]).eval()
-    program_weights(model, 0, 0)
-
-    exported = oi_to_analog(model, inplace=True)
-
-    assert exported is model
-    assert not oi_tiles(model)
+def test_standalone_analog_layer_is_supported():
+    from aihwkit.nn import AnalogLinear
+    analog = AnalogLinear(3, 2, rpu_config=InferenceRPUConfig()).eval()
+    model = OIModel(analog)
+    prepare(model, "test1", 86400.)
+    assert isinstance(model.to_analog(), AnalogModel)
 
 
-def test_model_noise_seeds_are_reproducible_and_distinct_per_tile():
-    seeds = dict(train=11, validation=22, evaluation=33)
+def test_model_seed_is_reproducible_and_distinct_per_tile():
     analog = make_model()
     rng = torch.random.get_rng_state().clone()
-    first = convert_to_oi(analog, 2, [0., 86400.], noise_seeds=seeds)
-    second = convert_to_oi(analog, 2, [0., 86400.], noise_seeds=seeds)
+    first = OIModel(analog, seed=11)
+    second = OIModel(analog, seed=11)
     assert torch.equal(rng, torch.random.get_rng_state())
     tiles = oi_tiles(first)
-    assert not torch.equal(tiles[0].noise_seeds, tiles[1].noise_seeds)
+    assert not torch.equal(tiles[0].noise_seed, tiles[1].noise_seed)
     for a, b in zip(tiles, oi_tiles(second)):
-        torch.testing.assert_close(a.noise_seeds, b.noise_seeds)
-    program_weights(first, 0, 0, noise_split="validation")
-    with pytest.raises(ValueError, match="split"):
-        program_weights(first, 0, 0, noise_split="typo")
+        torch.testing.assert_close(a.noise_seed, b.noise_seed)
+    with pytest.raises(TypeError, match="string"):
+        first.program(1)
 
 
-@pytest.mark.parametrize("seeds", [dict(train=1, validation=1, evaluation=2),
-                                   dict(train=-1, validation=2, evaluation=3),
-                                   dict(train=1)])
-def test_invalid_noise_seeds(seeds):
+@pytest.mark.parametrize("seed", [-1, 2**63, True, 1.5])
+def test_invalid_seed(seed):
     with pytest.raises(ValueError):
-        convert_to_oi(make_model(), 1, [0.], noise_seeds=seeds)
+        OIModel(make_model(), seed=seed)
 
 
-def test_default_noise_seeds_follow_manual_seed():
+def test_default_seed_follows_manual_seed():
     analog = make_model()
     torch.manual_seed(123)
-    first = convert_to_oi(analog, 1, [0.])
+    first = OIModel(analog)
     torch.manual_seed(123)
-    second = convert_to_oi(analog, 1, [0.])
+    second = OIModel(analog)
     for a, b in zip(oi_tiles(first), oi_tiles(second)):
-        torch.testing.assert_close(a.noise_seeds, b.noise_seeds)
+        torch.testing.assert_close(a.noise_seed, b.noise_seed)
 
+
+def test_digital_model_is_rejected():
+    with pytest.raises(TypeError, match="AIHWKIT"):
+        OIModel(nn.Linear(3, 2))
 
 
 @pytest.mark.parametrize("overrides", [{}, dict(conductance_lr=.003, significance_lr=.0002,
                                                bias_lr=.0003, output_scaling_lr=.0004)])
 def test_optimizer_groups_apply_independent_learning_rates(overrides):
-    model = convert_to_oi(make_model(), 1, [0.])
-    groups = optimization_parameters(model, include_bias=True, **overrides)
+    model = OIModel(make_model())
+    groups = model.optimization_parameters(include_bias=True, **overrides)
     expected = dict(conductances=overrides.get("conductance_lr", .01),
                     significance=overrides.get("significance_lr", .0001),
                     bias=overrides.get("bias_lr", .0001),
@@ -247,16 +238,43 @@ def test_optimizer_groups_apply_independent_learning_rates(overrides):
 
 
 def test_optimizer_groups_omit_frozen_parameters():
-    model = convert_to_oi(make_model(), 1, [0.])
+    model = OIModel(make_model())
     for tile in oi_tiles(model):
         tile.significance.requires_grad_(False)
         tile.out_scaling_alpha.requires_grad_(False)
-    groups = optimization_parameters(model)
+    groups = model.optimization_parameters()
     assert [group["name"] for group in groups] == ["conductances"]
 
 
 @pytest.mark.parametrize("rate", [-1., float("nan"), float("inf")])
 def test_optimizer_groups_reject_invalid_learning_rates(rate):
-    model = convert_to_oi(make_model(), 1, [0.])
+    model = OIModel(make_model())
     with pytest.raises(ValueError, match="learning rate"):
-        optimization_parameters(model, significance_lr=rate)
+        model.optimization_parameters(significance_lr=rate)
+
+
+def test_conversion_preserves_shared_analog_layers():
+    from aihwkit.nn import AnalogLinear, AnalogSequential
+    config = InferenceRPUConfig()
+    config.forward.is_perfect = True
+    layer = AnalogLinear(3, 3, rpu_config=config)
+    model = OIModel(AnalogSequential(layer, layer))
+    assert model._model[0] is model._model[1]
+    assert len(list(model.oi_tiles())) == 1
+    groups = model.optimization_parameters()
+    params = [p for group in groups for p in group['params']]
+    assert len(params) == len({id(p) for p in params})
+
+
+def test_oi_checkpoint_restores_named_noise():
+    analog = make_model()
+    first = OIModel(analog, seed=11)
+    first.program("test1")
+    first.drift(86400.)
+    restored = OIModel(analog, seed=99)
+    restored.load_state_dict(first.state_dict())
+    restored.program("test1")
+    restored.drift(86400.)
+    for a, b in zip(first.oi_tiles(), restored.oi_tiles()):
+        torch.testing.assert_close(a.noise_seed, b.noise_seed)
+        torch.testing.assert_close(a.active_weights, b.active_weights)

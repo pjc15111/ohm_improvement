@@ -1,47 +1,51 @@
 # Ohm Improvement
 
-## Reproducible PCM noise
+## Model and reproducible PCM noise
 
-Pass independent seeds when converting an AIHWKIT model:
+Construct `OIModel` from an AIHWKIT model (`AnalogWrapper`, `AnalogSequential`,
+or a standalone analog layer such as `AnalogLinear`):
 
 ```python
-model = oi.convert_to_oi(
-    analog_model, n_realizations=4, t_inferences=[0, 86400],
-    noise_seeds={"train": 101, "validation": 202, "evaluation": 303},
-)
-oi.program_weights(model, realization_index=0, time_index=1,
-                   noise_split="validation")
+import ohm_improvement as oi
+
+model = oi.OIModel(analog_model, seed=101)
+model.program("train1")
+model.drift(86400)
+output = model(inputs)
+stock_snapshot = model.to_analog()
 ```
 
-`noise_split` defaults to `"train"`; it is independent of `model.train()` and
-`model.eval()`. All three streams support indices `0 .. n_realizations-1`.
-Seeds must be distinct integers in `[0, 2**63)`. Omitting them samples seeds at
-conversion using PyTorch's global RNG. Direct `OITile` construction requires
-explicit, valid seeds; seed initialization and validation live in `convert_to_oi`. Explicit seeds and subsequent sample
-regeneration do not consume the global PyTorch RNG.
+`OIModel` copies the analog model by default; `inplace=True` converts it in place.
+Its methods replace the former free functions in `model.py`.
 
-Each tile stores only three seeds. Module paths distinguish tiles, and samples
-are regenerated on the conductance device and dtype. Programming and drift
-randomness is shared across times in a realization; read randomness is keyed by
-elapsed time. Calls can be repeated or reordered without changing the samples.
-The noisy conductances are recomputed from current parameters with autograd.
+Each tile owns one seed, derived from the model seed and tile path. Realization
+IDs are arbitrary strings, and noise sides are `"plus"`/`"minus"`. `program(id)`
+replaces one current realization; `drift(seconds)` always starts from its retained
+programmed conductances and drift coefficients, without compounding drift.
+Read noise is independently keyed by elapsed time. Explicit seeds and noise
+regeneration do not consume the global PyTorch RNG; omitting the model seed
+samples one from it. Direct `OITile` construction requires an explicit seed.
 
-Seeds are included in `state_dict`. Restore into a model with the same structure,
-conductance layout, realization count, and inference times, then call
-`program_weights` before inference. Reproducibility assumes the same PyTorch
-backend, device type, and dtype; CPU and CUDA samples need not agree. Older
-checkpoints containing full noise buffers require migration before strict loading.
+Reprogram after parameter updates or before starting a fresh backward graph.
+For several backward calls sharing one programmed state, use `retain_graph=True`
+until the last call, or accumulate losses and call backward once. MNIST follows
+this rule. Stale state after a parameter update is rejected.
 
-`experiments/mnist.py` exposes `--train-noise-seed`, `--validation-noise-seed`,
-and `--evaluation-noise-seed` (defaults 101, 202, 303).
+Seeds are included in `state_dict`. Restore into the same model structure and
+conductance layout, then call `program()` and optionally `drift()` before inference.
+This refactor changes checkpoint keys and noise streams; older checkpoints need
+migration. Reproducibility assumes the same PyTorch backend, device, and dtype.
+
+MNIST uses `--noise-seed` (default 101) with named training and test realizations,
+replacing the three train/validation/evaluation seed options.
 
 ## Optimizer parameter groups
 
-`optimization_parameters()` returns named groups ready for Adam:
+`OIModel.optimization_parameters()` returns named groups ready for Adam:
 
 ```python
-optimizer = torch.optim.Adam(oi.optimization_parameters(
-    model, conductance_lr=0.01, significance_lr=0.0001,
+optimizer = torch.optim.Adam(model.optimization_parameters(
+    conductance_lr=0.01, significance_lr=0.0001,
     include_bias=False, include_output_scaling=False,
 ))
 ```
@@ -64,15 +68,13 @@ LR. Bias and output scaling remain excluded from MNIST optimization.
   converter representations, such as affine single-device mappings, are unsupported.
 - Seeds control PCM noise, not AIHWKIT's backend forward/calibration RNG. Exact
   repeatability requires perfect forward I/O and the same backend/device/dtype.
-- OITile still uses integer realization/time indices and three named noise streams.
-  It recomputes programming on each call; separate `program()`/`drift()` operations,
-  string realization IDs/sides, and one base seed remain planned.
 - OI scale is fixed; trainable pair significance is clamped to `[0.1, 5]`, without
   hardware-discrete constraints. Conductance optimization can change nominal weights.
 - The backend tile is held outside PyTorch submodule registration: move the analog
   model to its target device before OI conversion. Checkpoint restoration requires
   matching construction settings and reprogramming; old noise-buffer checkpoints
-  need migration. Shared-module aliases are not preserved by OI conversion.
+  need migration. AIHWKIT's initial digital-to-analog conversion may lose shared
+  aliases; OI conversion preserves the aliases it receives.
 - The evaluator retains one realization and a frozen scheme snapshot, mutates the
   supplied analog model, and requires matching tile paths and mapping scales.
 - Experiments currently cover MNIST; paper-scale benchmarks/device models and WPO

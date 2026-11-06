@@ -54,9 +54,7 @@ def parse_args(argv=None):
     parser.add_argument('--save-model', action='store_true')
     parser.add_argument('--results-file', default='results/mnist.json')
     parser.add_argument('--data-dir', default='data')
-    parser.add_argument('--train-noise-seed', type=int, default=101)
-    parser.add_argument('--validation-noise-seed', type=int, default=202)
-    parser.add_argument('--evaluation-noise-seed', type=int, default=303)
+    parser.add_argument('--noise-seed', type=int, default=101)
     parser.add_argument('--oi-epochs', type=int, default=1)
     parser.add_argument('--oi-lr', '--conductance-lr', dest='oi_lr', type=float, default=0.01,
                         help='OI conductance learning rate')
@@ -69,9 +67,8 @@ def parse_args(argv=None):
     parser.add_argument('--pair-factors', type=float, nargs='+', default=[1.0])
     parser.add_argument('--optimize-significance', action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
-    seeds = (args.train_noise_seed, args.validation_noise_seed, args.evaluation_noise_seed)
-    if len(set(seeds)) != 3 or any(not 0 <= seed < 2**63 for seed in seeds):
-        parser.error('noise seeds must be distinct integers in [0, 2**63)')
+    if not 0 <= args.noise_seed < 2**63:
+        parser.error('noise seed must be an integer in [0, 2**63)')
     if any(value <= 0 for value in (args.batch_size, args.test_batch_size, args.epochs,
                                    args.oi_epochs, args.train_realizations,
                                    args.evaluation_realizations, args.log_interval)):
@@ -182,31 +179,32 @@ def train_digital_model(args, train_loader, test_loader, device):
     return model.eval(), history
 
 
-def optimize_oi_batch(oi_model, inputs, targets, realizations, n_times, optimizer):
+def optimize_oi_batch(oi_model: oi.OIModel, inputs, targets, realization_ids, times, optimizer):
     """Average task loss over hardware samples, then update and clamp once."""
     optimizer.zero_grad(set_to_none=True)
     total_loss, correct = 0., 0
     samples = []
-    n_samples = len(realizations) * n_times
-    for realization in realizations:
-        for time_index in range(n_times):
-            oi.program_weights(oi_model, realization, time_index)
+    n_samples = len(realization_ids) * len(times)
+    for realization_id in realization_ids:
+        oi_model.program(realization_id)
+        for time_index, time in enumerate(times):
+            oi_model.drift(time)
             output = oi_model(inputs)
             loss = F.nll_loss(output, targets)
-            (loss / n_samples).backward()
+            (loss / n_samples).backward(retain_graph=time_index < len(times) - 1)
             total_loss += loss.item() * targets.numel()
             sample_correct = (output.argmax(dim=-1) == targets).sum().item()
             correct += sample_correct
             samples.append(HistoryRecord(
-                realization_id=f'train{realization + 1}', time_index=time_index, batch=0,
+                realization_id=realization_id, time_index=time_index, batch=0,
                 loss=loss.item(), accuracy=sample_correct / targets.numel(), count=targets.numel(),
             ))
     optimizer.step()
-    oi.clamp_model(oi_model)
+    oi_model.clamp()
     return dict(loss_sum=total_loss, correct=correct, count=targets.numel() * n_samples, samples=samples)
 
 
-def optimize_oi_epoch(oi_model, loader, device, realizations, times, optimizer, log_interval):
+def optimize_oi_epoch(oi_model: oi.OIModel, loader, device, realization_ids, times, optimizer, log_interval):
     # Keep backend inference behavior while optimizing conductances with autograd.
     oi_model.eval()
     synchronize_device(device)
@@ -215,7 +213,7 @@ def optimize_oi_epoch(oi_model, loader, device, realizations, times, optimizer, 
     total_loss, correct, count = 0., 0, 0
     for batch_index, (inputs, targets) in enumerate(loader):
         batch = optimize_oi_batch(oi_model, inputs.to(device), targets.to(device),
-                                  realizations, len(times), optimizer)
+                                  realization_ids, times, optimizer)
         synchronize_device(device)
         elapsed = perf_counter() - start
         for record in batch['samples']:
@@ -232,14 +230,10 @@ def optimize_oi_epoch(oi_model, loader, device, realizations, times, optimizer, 
     return dict(loss=total_loss / count, accuracy=correct / count, count=count, samples=samples)
 
 
-def optimize_oi(args, analog_model, train_loader, device):
-    oi_model = oi.convert_to_oi(
-        analog_model, n_realizations=args.train_realizations, t_inferences=args.times,
-        noise_seeds=dict(train=args.train_noise_seed, validation=args.validation_noise_seed,
-                         evaluation=args.evaluation_noise_seed),
-    )
-    parameters = oi.optimization_parameters(
-        oi_model, include_conductances=True, include_output_scaling=False,
+def optimize_oi(args, analog_model: oi.AnalogModel, train_loader, device):
+    oi_model = oi.OIModel(analog_model, seed=args.noise_seed)
+    parameters = oi_model.optimization_parameters(
+        include_conductances=True, include_output_scaling=False,
         include_bias=False, include_significance=args.optimize_significance,
         conductance_lr=args.oi_lr, significance_lr=args.significance_lr,
         bias_lr=args.bias_lr, output_scaling_lr=args.output_scaling_lr,
@@ -249,7 +243,7 @@ def optimize_oi(args, analog_model, train_loader, device):
     start = perf_counter()
     for epoch in range(1, args.oi_epochs + 1):
         offset = perf_counter() - start
-        metrics = optimize_oi_epoch(oi_model, train_loader, device, range(args.train_realizations),
+        metrics = optimize_oi_epoch(oi_model, train_loader, device, [f"train{i + 1}" for i in range(args.train_realizations)],
                                     args.times, optimizer, args.log_interval)
         elapsed = perf_counter() - start
         for sample in metrics['samples']:
@@ -261,7 +255,7 @@ def optimize_oi(args, analog_model, train_loader, device):
     return oi_model, history
 
 
-def run_comparison(analog_model, oi_model, loader, device, realization_ids, times, seed):
+def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, device, realization_ids, times, seed):
     """Evaluate ordinary and optimized mappings through the same stock simulator."""
     evaluate = partial(evaluate_classifier, loader=loader, device=device)
     # Snapshot both schemes before evaluation mutates the retained analog model.
@@ -306,7 +300,7 @@ def main(argv=None):
     results = run_comparison(
         analog_model, oi_model, test_loader, device,
         [f'test{i + 1}' for i in range(args.evaluation_realizations)],
-        args.times, args.evaluation_noise_seed,
+        args.times, args.noise_seed,
     )
     history = ExperimentHistory(
         config=vars(args), digital_baseline=digital_history[-1]['evaluation'],

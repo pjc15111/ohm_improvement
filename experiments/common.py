@@ -1,17 +1,5 @@
 """Evaluate programming schemes using stock AIHWKIT conductance noise.
 
-TODO (next commit): Give OITile string realization IDs and one base noise seed,
-replacing integer indices and separate train/validation/evaluation seeds.
-Use string sides ("plus" / "minus") in OITile as part of that refactor.
-Also split OITile programming from drift: retain one current programmed
-realization, replace it with program(realization_id), and reuse it for drift(t).
-Reprogram after parameter updates; account for autograd graph lifetime when
-reusing programmed tensors across backward calls.
-Cleanup: Move model.py functions into an OIModel class. All OI-model inputs
-should require that class; analog-model inputs should require AIHWKIT's analog
-container types (AnalogWrapper/AnalogSequential via AnalogContainerBase), with
-explicit support for standalone analog layers if needed.
-
 Conductances use canonical [out_features, in_features] layout. Tile names match
 those in the original analog model, retained before conversion to OI.
 """
@@ -35,7 +23,7 @@ from aihwkit.simulator.tiles.inference import InferenceTile
 from ohm_improvement.conductance import (
     ConductanceMapping, convert_to_conductances, convert_back_to_weights,
 )
-from ohm_improvement.tiles import OITile
+from ohm_improvement.model import AnalogModel, OIModel
 
 
 @dataclass
@@ -83,12 +71,12 @@ class ProgrammedTileRealization:
     compensation_baseline: Optional[Tensor]
 
 
-def extract_oi_programming(oi_model: nn.Module) -> dict[str, TileProgrammingScheme]:
+def extract_oi_programming(oi_model: OIModel) -> dict[str, TileProgrammingScheme]:
     """Snapshot optimized targets and digital parameters without simulating noise."""
+    if not isinstance(oi_model, OIModel):
+        raise TypeError("Expected OIModel")
     schemes = {}
-    for name, tile in oi_model.named_modules():
-        if not isinstance(tile, OITile):
-            continue
+    for name, tile in oi_model.named_oi_tiles():
 
         def canonical(g):
             g = g.detach()
@@ -109,7 +97,7 @@ def extract_oi_programming(oi_model: nn.Module) -> dict[str, TileProgrammingSche
 
 
 def extract_analog_programming(
-    analog_model: nn.Module,
+    analog_model: AnalogModel,
     *,
     converter: Optional[BaseConductanceConverter] = None,
 ) -> dict[str, TileProgrammingScheme]:
@@ -120,6 +108,8 @@ def extract_analog_programming(
     Read nominal tile weights without applying mapping/output scales. Custom
     converters may require CPU initialization before transfer to the tile device.
     """
+    if not isinstance(analog_model, AnalogModel):
+        raise TypeError("Expected an AIHWKIT analog model or layer")
     schemes = {}
     with torch.no_grad():
         for name, tile in analog_model.named_modules():
@@ -154,7 +144,7 @@ class StockProgrammingEvaluator:
     calls use a separate AIHWKIT RNG and need not repeat exactly.
     """
 
-    _model: nn.Module
+    _model: AnalogModel
     _tiles: list[tuple[str, InferenceTile, TileProgrammingScheme]]
     _current_programmed: dict[str, ProgrammedTileRealization]
     _seed: int
@@ -162,7 +152,7 @@ class StockProgrammingEvaluator:
 
     def __init__(
         self,
-        analog_model: nn.Module,
+        analog_model: AnalogModel,
         schemes: Mapping[str, TileProgrammingScheme],
         *,
         seed: int,
@@ -176,6 +166,8 @@ class StockProgrammingEvaluator:
         The seed selects an independent evaluation stream; stock RNG calls must
         be isolated from the caller's RNG state. Do not program weights yet.
         """
+        if not isinstance(analog_model, AnalogModel):
+            raise TypeError("Expected an AIHWKIT analog model or layer")
         if type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError("seed must be an integer in [0, 2**63)")
         tiles = {name: tile for name, tile in analog_model.named_modules()
@@ -210,7 +202,7 @@ class StockProgrammingEvaluator:
         self._current_programmed = {}
 
     @property
-    def model(self) -> nn.Module:
+    def model(self) -> AnalogModel:
         """The supplied analog model, ready for inference after program/drift."""
         return self._model
 
@@ -378,14 +370,14 @@ class StockProgrammingEvaluator:
 
 
 def evaluator_from_oi(
-    oi_model: nn.Module, analog_model: nn.Module, *, seed: int,
+    oi_model: OIModel, analog_model: AnalogModel, *, seed: int,
 ) -> StockProgrammingEvaluator:
     """Use OI targets with the retained original analog model, mutated in place."""
     return StockProgrammingEvaluator(analog_model, extract_oi_programming(oi_model), seed=seed)
 
 
 def evaluator_from_analog(
-    analog_model: nn.Module, *, seed: int,
+    analog_model: AnalogModel, *, seed: int,
     converter: Optional[BaseConductanceConverter] = None,
 ) -> StockProgrammingEvaluator:
     """Use stock or WPO targets and evaluate in the supplied analog model."""
@@ -420,7 +412,7 @@ def evaluate_classifier(
 
 def evaluate_programming(
     evaluator: StockProgrammingEvaluator,
-    evaluate: Callable[[nn.Module], Mapping[str, float | int]],
+    evaluate: Callable[[AnalogModel], Mapping[str, float | int]],
     realization_ids: Iterable[str],
     times: Iterable[float],
 ) -> list[dict[str, str | float | int]]:

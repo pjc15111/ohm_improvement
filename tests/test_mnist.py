@@ -31,22 +31,20 @@ def test_loaders_shuffle_only_training_and_bound_dry_run(monkeypatch):
 def test_oi_batch_updates_only_selected_parameters():
     # A small inference model exercises the batch update without MNIST data.
     from aihwkit.nn.conversion import convert_to_analog
-    from ohm_improvement.model import convert_to_oi, optimization_parameters
+    from ohm_improvement.model import OIModel
     from ohm_improvement.tiles import OITile
     config = mnist.make_rpu_config([1., 2.])
     config.forward.is_perfect = True
     analog = convert_to_analog(nn.Sequential(nn.Linear(3, 2), nn.LogSoftmax(dim=1)),
                                rpu_config=config)
-    model = convert_to_oi(analog, 2, [0., 86400.])
+    model = OIModel(analog)
     tile = next(t for t in model.modules() if isinstance(t, OITile))
     before = [g.detach().clone() for g in tile.g_plus]
     bias = tile.bias.detach().clone()
     significance = tile.significance.detach().clone()
-    optimizer = torch.optim.Adam(optimization_parameters(
-        model, include_output_scaling=False, include_bias=False, include_significance=False,
-        conductance_lr=.01))
+    optimizer = torch.optim.Adam(model.optimization_parameters(include_output_scaling=False, include_bias=False, include_significance=False, conductance_lr=.01))
     metrics = mnist.optimize_oi_batch(model.eval(), torch.tensor([[.2, -.4, .8], [.1, .3, -.2]]),
-                                      torch.tensor([0, 1]), range(2), 2, optimizer)
+                                      torch.tensor([0, 1]), ["train1", "train2"], [0., 86400.], optimizer)
     assert metrics['count'] == 8
     assert len(metrics['samples']) == 4
     assert {(r.realization_id, r.time_index) for r in metrics['samples']} == {

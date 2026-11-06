@@ -18,8 +18,13 @@ from experiments.common import (
     extract_analog_programming, extract_oi_programming,
 )
 from ohm_improvement.conductance import convert_back_to_weights
-from ohm_improvement.model import convert_to_oi
+from ohm_improvement.model import OIModel
 from ohm_improvement.tiles import OITile
+
+
+def prepare(model: OIModel, realization_id: str, time: float):
+    model.program(realization_id)
+    model.drift(time)
 
 
 @pytest.fixture(params=["cpu", "cuda"])
@@ -53,7 +58,7 @@ def tensors(scheme):
 @pytest.mark.parametrize("digital_parameters", [False, True])
 def test_oi_extraction_matches_analog_without_programming(device, digital_parameters):
     analog = make_model(device, digital_parameters)
-    oi = convert_to_oi(analog, 1, [0.], noise_seeds=dict(train=11, validation=22, evaluation=33))
+    oi = OIModel(analog, seed=11)
     stock_schemes = extract_analog_programming(analog)
     oi_schemes = extract_oi_programming(oi)
     assert stock_schemes.keys() == oi_schemes.keys()
@@ -73,7 +78,7 @@ def test_oi_extraction_matches_analog_without_programming(device, digital_parame
 
 
 def test_oi_extraction_preserves_optimized_pairs_and_owns_storage(device):
-    oi = convert_to_oi(make_model(device), 1, [0.])
+    oi = OIModel(make_model(device))
     tile = next(t for t in oi.modules() if isinstance(t, OITile))
     with torch.no_grad():
         tile.g_plus[0].add_(0.2)
@@ -82,7 +87,7 @@ def test_oi_extraction_preserves_optimized_pairs_and_owns_storage(device):
         tile.out_scaling_alpha.mul_(1.2)
         tile.bias.add_(0.1)
     schemes = extract_oi_programming(oi)
-    name = next(name for name, t in oi.named_modules() if t is tile)
+    name = next(name for name, t in oi.named_oi_tiles() if t is tile)
     scheme = schemes[name]
     expected = tile.g_plus[0].T if device.type == "cuda" else tile.g_plus[0]
     torch.testing.assert_close(scheme.conductances.g_plus[0], expected)
@@ -141,14 +146,13 @@ def test_evaluator_noiseless_preserves_outputs_and_digital_parameters(device, co
         tile.rpu_config.noise_model.read_noise_scale = 0.
         if not compensation:
             tile.rpu_config.drift_compensation = None
-    oi = convert_to_oi(analog, 1, [0.])
+    oi = OIModel(analog)
     with torch.no_grad():
         for tile in oi.modules():
             if isinstance(tile, OITile):
                 tile.bias.add_(0.1)
                 tile.out_scaling_alpha.mul_(1.2)
-    from ohm_improvement.model import program_weights
-    program_weights(oi, 0, 0)
+    prepare(oi, "train1", 0.0)
     x = torch.tensor([[0.2, -0.4, 0.8]], device=device)
     expected = oi(x).detach()
     mapping_scales = [tile.get_mapping_scales().clone() for tile in analog.analog_tiles()]
@@ -366,3 +370,13 @@ def test_evaluate_programming_records_each_time_and_programs_once(device, monkey
         ("test1", 0.), ("test1", 86400.), ("test2", 0.), ("test2", 86400.)]
     assert all(r["count"] == 2 and 0 <= r["accuracy"] <= 1
                and math.isfinite(r["loss"]) for r in results)
+
+
+def test_extraction_requires_the_expected_model_classes():
+    digital = nn.Linear(3, 2)
+    with pytest.raises(TypeError, match="OIModel"):
+        extract_oi_programming(digital)
+    with pytest.raises(TypeError, match="AIHWKIT"):
+        extract_analog_programming(digital)
+    with pytest.raises(TypeError, match="AIHWKIT"):
+        StockProgrammingEvaluator(digital, {}, seed=11)

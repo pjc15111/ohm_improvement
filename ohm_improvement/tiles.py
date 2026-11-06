@@ -5,13 +5,15 @@ from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.simulator.tiles.functions import AnalogFunction
 
 import hashlib
+import json
+import math
 
 import torch.nn as nn
 
 import torch
 
 from torch import Tensor
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -35,22 +37,15 @@ class OITile(nn.Module):
     def __init__(
         self,
         tile,
-        n_realizations: int,
-        t_inferences: List[float],
-        g_converter: Optional[BaseConductanceConverter],
+        g_converter: Optional[BaseConductanceConverter] = None,
         train_significance = True,
         *,
-        noise_seeds,
+        seed: int,
     ):
         nn.Module.__init__(self)
 
-        self.n_realizations = n_realizations
-        self.t_inferences = t_inferences
-
         if tile.__class__ not in {InferenceTile}:
             raise TypeError("OITile only supports conversion of InferenceTile")
-
-        # probably want to initialize weights using a Converter
 
         self.train(tile.training)
 
@@ -82,7 +77,12 @@ class OITile(nn.Module):
 
         self.analog_tile_holder = AnalogTileHolder(tile)
         self.init_conductances(train_significance, g_converter)
-        self.init_noise(n_realizations, len(t_inferences), noise_seeds)
+        # Model construction initializes/validates seeds; direct callers supply one.
+        self.register_buffer("noise_seed", torch.tensor(seed, dtype=torch.int64))
+        self._programmed = None
+        self._realization_id = None
+        self._parameter_versions = []
+        self._drifted = False
 
     def get_analog_tile(self) -> InferenceTile:
         """Return the underlying AIHWKIT analog tile."""
@@ -145,39 +145,31 @@ class OITile(nn.Module):
         )
         self.register_buffer("scale", mapping.scale.detach().clone())
 
-    def init_noise(self, n_realizations: int, n_times: int, noise_seeds) -> None:
-        """Store seeds already initialized and validated by convert_to_oi.
+    def noise_sample(self, kind: str, pair: int, side: str,
+                     realization_id: str, t_inference: float = 0.) -> Tensor:
+        """Regenerate a sample without changing the global RNG.
 
-        Direct OITile callers must supply valid train/validation/evaluation seeds.
+        Programming/drift samples omit time; read samples are keyed by elapsed
+        time. Reproducibility is within a backend/device/dtype, not across them.
         """
-        if n_realizations < 1 or n_times < 1:
-            raise ValueError("n_realizations and n_times must be positive")
-        self.n_realizations = n_realizations
-        self.register_buffer("noise_seeds", torch.tensor(
-            [noise_seeds[name] for name in ("train", "validation", "evaluation")],
-            dtype=torch.int64,
-        ))
-
-    def noise_sample(self, kind, pair, side, realization, time_index=0,
-                     noise_split="train"):
-        """Return fixed randomness without touching the global RNG.
-
-        Programming and drift samples are shared across timestamps. Read samples
-        are keyed by elapsed time, independent of evaluation order or time grid.
-        Reproducibility is within a device/backend and dtype, not across CPU/CUDA.
-        """
-        names = ("train", "validation", "evaluation")
-        if noise_split not in names:
-            raise ValueError(f"Unknown noise split: {noise_split}")
+        if side not in ("plus", "minus"):
+            raise ValueError("side must be 'plus' or 'minus'")
         if kind not in ("program", "drift", "read"):
             raise ValueError(f"Unknown noise kind: {kind}")
-        seed = int(self.noise_seeds[names.index(noise_split)].item())
-        timestamp = float(self.t_inferences[time_index]).hex() if kind == "read" else ""
-        key = f"{seed}:{kind}:{pair}:{side}:{realization}:{timestamp}"
+        if not isinstance(realization_id, str):
+            raise TypeError("realization_id must be a string")
+        timestamp = float(t_inference or 0.).hex() if kind == "read" else None
+        key = json.dumps([self.noise_seed.item(), kind, pair, side, realization_id, timestamp])
         derived = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "little")
         g = self.g_plus[pair]
         generator = torch.Generator(device=g.device).manual_seed(derived)
         return torch.randn(g.shape, generator=generator, device=g.device, dtype=g.dtype)
+
+    def _require_programmed(self):
+        if self._programmed is None:
+            raise RuntimeError("Call program() first")
+        if any(p._version != version for p, version in self._parameter_versions):
+            raise RuntimeError("Parameters changed; call program() again")
 
     def apply_out_scaling(self, values, tensor_view):
         if self.out_scaling_alpha is not None:
@@ -185,8 +177,7 @@ class OITile(nn.Module):
         return values
 
     def analog_forward(self, x_input):
-        if self.active_weights is None:
-            raise RuntimeError("Call program_weights() before forward()")
+        self._require_programmed()
 
         tile = self.get_analog_tile()
         return AnalogFunction.apply(
@@ -207,74 +198,60 @@ class OITile(nn.Module):
             )
         ).contiguous()
 
-    def program_weights(
-        self,
-        realization_index: int,
-        time_index: int,
-        noise_split: str = "train",
-    ) -> None:
-        if not 0 <= realization_index < self.n_realizations:
-            raise IndexError("realization_index out of range")
-        if not 0 <= time_index < len(self.t_inferences):
-            raise IndexError("time_index out of range")
-        if noise_split not in ("train", "validation", "evaluation"):
-            raise ValueError(f"Unknown noise split: {noise_split}")
-        time = self.t_inferences[time_index]
-        if time < 0:
-            raise ValueError("time must be nonnegative")
+    def program(self, realization_id: str) -> None:
+        """Retain one programmed realization and its drift coefficients.
 
-        r = realization_index
-        t = time_index
-
-        programmed = ([], [])
-        drift_coefficients = ([], [])
-
-        for side, targets in enumerate((self.g_plus, self.g_minus)):
-            for p, g_target in enumerate(targets):
-                programmed[side].append(
-                    self.noise_model.apply_programming_noise_to_conductance(
-                        g_target,
-                        self.noise_sample("program", p, side, r, t, noise_split),
-                    )
-                )
-                drift_coefficients[side].append(
-                    self.noise_model.generate_drift_coefficients(
-                        g_target,
-                        self.noise_sample("drift", p, side, r, t, noise_split),
-                    )
-                )
-
-        # Compensation reference: programmed state, before drift.
+        This builds an autograd graph. For multiple backward calls sharing this
+        state, retain_graph=True is required until the last call. Reprogram after
+        backward to start a new graph, and after any parameter update.
+        """
+        if not isinstance(realization_id, str):
+            raise TypeError("realization_id must be a string")
+        self._programmed = None
+        self.active_weights = None
+        self._drifted = False
+        programmed, coefficients = [], []
+        for side, targets in (("plus", self.g_plus), ("minus", self.g_minus)):
+            gp, nu = [], []
+            for pair, target in enumerate(targets):
+                gp.append(self.noise_model.apply_programming_noise_to_conductance(
+                    target, self.noise_sample("program", pair, side, realization_id)))
+                nu.append(self.noise_model.generate_drift_coefficients(
+                    target, self.noise_sample("drift", pair, side, realization_id)))
+            programmed.append(gp)
+            coefficients.append(nu)
+        self.install_conductances(*programmed)
         if self.compensation is not None:
-            self.install_conductances(*programmed)
             self.reference = self.compensation.init_baseline(
-                self.get_analog_tile(),
-                self.active_weights
-            )
+                self.get_analog_tile(), self.active_weights)
+        self._programmed = (programmed, coefficients)
+        self._realization_id = realization_id
+        self._parameter_versions = [(p, p._version) for p in self.parameters()]
 
-        drifted = ([], [])
-
-        for side in range(2):
-            for p, (g_prog, nu) in enumerate(
-                    zip(programmed[side], drift_coefficients[side])
-            ):
-                drifted[side].append(
-                    self.noise_model.apply_drift_noise_to_conductance(
-                        g_prog,
-                        nu,
-                        time,
-                        self.noise_sample("read", p, side, r, t, noise_split),
-                    )
-                )
-
+    def drift(self, t_inference: float) -> None:
+        """Apply drift/read noise from the retained state, without compounding."""
+        self._require_programmed()
+        t_inference = float(t_inference)
+        if not math.isfinite(t_inference) or t_inference < 0:
+            raise ValueError("t_inference must be finite and nonnegative")
+        programmed, coefficients = self._programmed
+        drifted = []
+        for side, gs, nus in zip(("plus", "minus"), programmed, coefficients):
+            drifted.append([
+                self.noise_model.apply_drift_noise_to_conductance(
+                    g, nu, t_inference,
+                    self.noise_sample("read", pair, side, self._realization_id, t_inference))
+                for pair, (g, nu) in enumerate(zip(gs, nus))
+            ])
         self.install_conductances(*drifted)
+        self._drifted = True
 
     def forward(
         self, x_input: Tensor, tensor_view: Optional[Tuple[int, ...]] = None
     ) -> Tensor:
 
         output = self.analog_forward(x_input)
-        if self.compensation is not None:
+        if self.compensation is not None and self._drifted:
             probe = self.compensation.get_readout_tensor(
                 self.get_analog_tile().in_size
             ).to(self.active_weights)
@@ -302,10 +279,12 @@ class OITile(nn.Module):
         self.significance.clamp_(0.1, 5.0)
 
     def to_analog(self):
-        if self.active_weights is None:
-            raise RuntimeError("Call program_weights() before to_analog()")
+        self._require_programmed()
 
         tile = deepcopy(self.get_analog_tile())
+        # Bind the copy's disposable holder before supplying snapshot weights;
+        # its first binding may otherwise overwrite them with backend state.
+        tile.ensure_shared_weights()
 
         # Independent storage, registered for ordinary PyTorch handling.
         tile.shared_weights = nn.Parameter(
@@ -314,7 +293,8 @@ class OITile(nn.Module):
         )
 
         with torch.no_grad():
-            if self.compensation is not None:
+            tile.alpha = torch.ones_like(tile.alpha)
+            if self.compensation is not None and self._drifted:
                 probe = self.compensation.get_readout_tensor(
                     tile.in_size
                 ).to(tile.shared_weights)
