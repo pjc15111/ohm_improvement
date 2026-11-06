@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 
 import pytest
@@ -300,3 +301,68 @@ def test_scheme_detached_copy_handles_autograd_and_optional_parameters():
         torch.testing.assert_close(actual, expected)
     minimal = TileProgrammingScheme(copied.conductances).detached_copy()
     assert minimal.bias is None and minimal.output_scaling is None
+
+
+@pytest.mark.parametrize("log_probabilities", [False, True])
+def test_evaluate_classifier_metrics_weight_examples_not_batches(log_probabilities):
+    from experiments.common import evaluate_classifier
+    from torch.utils.data import DataLoader, TensorDataset
+    logits = torch.tensor([[3., 0.], [0., 2.], [1., 0.]])
+    targets = torch.tensor([0, 0, 1])
+    outputs = logits.log_softmax(dim=1) if log_probabilities else logits
+    loader = DataLoader(TensorDataset(outputs, targets), batch_size=2)
+    model = nn.Identity().train()
+    result = evaluate_classifier(model, loader, torch.device("cpu"))
+    assert result["count"] == 3
+    assert result["accuracy"] == pytest.approx(1 / 3)
+    assert result["loss"] == pytest.approx(
+        torch.nn.functional.cross_entropy(logits, targets).item())
+    assert not model.training
+
+
+def test_evaluate_classifier_rejects_empty_loader():
+    from experiments.common import evaluate_classifier
+    from torch.utils.data import DataLoader, TensorDataset
+    loader = DataLoader(TensorDataset(torch.empty(0, 2), torch.empty(0, dtype=torch.long)))
+    with pytest.raises(ValueError, match="empty"):
+        evaluate_classifier(nn.Identity(), loader, torch.device("cpu"))
+
+
+def test_evaluate_programming_records_each_time_and_programs_once(device, monkeypatch):
+    from experiments.common import evaluate_classifier, evaluate_programming
+    from torch.utils.data import DataLoader, TensorDataset
+    model = make_model(device)
+    evaluator = evaluator_from_analog(model, seed=123)
+    loader = DataLoader(TensorDataset(torch.tensor([[.2, -.4, .8], [.1, .7, -.2]]),
+                                     torch.tensor([0, 1])), batch_size=1)
+    calls = []
+    program, drift = evaluator.program, evaluator.drift
+
+    def record_program(realization_id):
+        calls.append(("program", realization_id))
+        return program(realization_id)
+
+    def record_drift(time):
+        calls.append(("drift", time))
+        return drift(time)
+
+    monkeypatch.setattr(evaluator, "program", record_program)
+    monkeypatch.setattr(evaluator, "drift", record_drift)
+    evaluated_models = []
+
+    def evaluate(programmed_model):
+        assert not programmed_model.training
+        evaluated_models.append(programmed_model)
+        return {**evaluate_classifier(programmed_model, loader, device),
+                "custom_metric": 42}
+
+    results = evaluate_programming(evaluator, evaluate,
+                                  iter(["test1", "test2"]), iter([0., 86400.]))
+    assert evaluated_models == [model] * 4
+    assert all(result["custom_metric"] == 42 for result in results)
+    assert calls == [("program", "test1"), ("drift", 0.), ("drift", 86400.),
+                     ("program", "test2"), ("drift", 0.), ("drift", 86400.)]
+    assert [(r["realization_id"], r["t_inference"]) for r in results] == [
+        ("test1", 0.), ("test1", 86400.), ("test2", 0.), ("test2", 86400.)]
+    assert all(r["count"] == 2 and 0 <= r["accuracy"] <= 1
+               and math.isfinite(r["loss"]) for r in results)

@@ -1,1 +1,5 @@
+# Torch and the AIHWKIT GPU wheel are installed explicitly by scripts/setup.sh.
+numpy
+torchvision==0.25.0  # Matches the Torch 2.10.0 build in setup.sh.
 pytest
+matplotlib

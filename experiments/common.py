@@ -21,10 +21,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-from typing import Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 from aihwkit.inference.converter.base import BaseConductanceConverter
 
@@ -390,3 +392,56 @@ def evaluator_from_analog(
     return StockProgrammingEvaluator(
         analog_model, extract_analog_programming(analog_model, converter=converter), seed=seed,
     )
+
+
+@torch.no_grad()
+def evaluate_classifier(
+    model: nn.Module, loader: DataLoader, device: torch.device,
+) -> dict[str, float | int]:
+    """Return mean loss, accuracy (0–1), and count for classification examples.
+
+    Accept logits or log probabilities shaped [batch, classes] and integer class
+    targets. Leave the model in eval mode; move batches to device, not the model.
+    """
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    count = 0
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        output = model(inputs)
+        total_loss += F.cross_entropy(output, targets, reduction="sum").item()
+        correct += (output.argmax(dim=-1) == targets).sum().item()
+        count += targets.numel()
+    if count == 0:
+        raise ValueError("Cannot evaluate an empty loader")
+    return {"loss": total_loss / count, "accuracy": correct / count, "count": count}
+
+
+def evaluate_programming(
+    evaluator: StockProgrammingEvaluator,
+    evaluate: Callable[[nn.Module], Mapping[str, float | int]],
+    realization_ids: Iterable[str],
+    times: Iterable[float],
+) -> list[dict[str, str | float | int]]:
+    """Return one metrics record per realization/time, without averaging curves.
+
+    Program once per realization, then drift from that state for each elapsed
+    time in seconds. Call evaluate(model) after each drift; its returned metrics
+    are recorded with the realization ID and elapsed time. The callback controls
+    gradient tracking and can capture its own data/device configuration.
+    The model is passed in eval mode and left at the last realization/time.
+    """
+    times = tuple(times)
+    results = []
+    for realization_id in realization_ids:
+        evaluator.program(realization_id)
+        for time in times:
+            evaluator.drift(time)
+            metrics = evaluate(evaluator.model.eval())
+            results.append({
+                **metrics,
+                "realization_id": realization_id,
+                "t_inference": float(time),
+            })
+    return results
