@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 from typing import Optional, Tuple, List
 from copy import deepcopy
+from dataclasses import dataclass
 
 from .compensation import convert_compensation
 from .conductance import (
@@ -23,9 +24,11 @@ from .conductance import (
 from .noise import convert_noise_model
 
 
-class TileHolder():
-    def __init__(self, tile):
-        self.tile = tile
+@dataclass
+class AnalogTileHolder:
+    """Hold the backend tile without registering it as a PyTorch submodule."""
+
+    analog_tile: InferenceTile
 
 
 class OITile(nn.Module):
@@ -77,16 +80,20 @@ class OITile(nn.Module):
                 requires_grad=tile.bias.requires_grad
             )
 
-        self.tile = TileHolder(tile)
+        self.analog_tile_holder = AnalogTileHolder(tile)
         self.init_conductances(train_significance, g_converter)
         self.init_noise(n_realizations, len(t_inferences), noise_seeds)
+
+    def get_analog_tile(self) -> InferenceTile:
+        """Return the underlying AIHWKIT analog tile."""
+        return self.analog_tile_holder.analog_tile
 
     def init_conductances(
         self,
         train_significance,
         g_converter: Optional[BaseConductanceConverter] = None,
     ) -> None:
-        tile = self.tile.tile
+        tile = self.get_analog_tile()
 
         if tile.shared_weights is None:
             raise ValueError("OITile requires a tile with shared_weights")
@@ -181,7 +188,7 @@ class OITile(nn.Module):
         if self.active_weights is None:
             raise RuntimeError("Call program_weights() before forward()")
 
-        tile = self.tile.tile
+        tile = self.get_analog_tile()
         return AnalogFunction.apply(
             tile.get_analog_ctx(),
             tile,
@@ -241,7 +248,7 @@ class OITile(nn.Module):
         if self.compensation is not None:
             self.install_conductances(*programmed)
             self.reference = self.compensation.init_baseline(
-                self.tile.tile,
+                self.get_analog_tile(),
                 self.active_weights
             )
 
@@ -269,7 +276,7 @@ class OITile(nn.Module):
         output = self.analog_forward(x_input)
         if self.compensation is not None:
             probe = self.compensation.get_readout_tensor(
-                self.tile.tile.in_size
+                self.get_analog_tile().in_size
             ).to(self.active_weights)
             probe_output = self.analog_forward(probe)
             output = self.compensation.apply(
@@ -277,7 +284,7 @@ class OITile(nn.Module):
             )
 
         if tensor_view is None:
-            tensor_view = self.tile.tile.get_tensor_view(output.dim())
+            tensor_view = self.get_analog_tile().get_tensor_view(output.dim())
         out = self.apply_out_scaling(output, tensor_view)
 
         if self.digital_bias:
@@ -298,7 +305,7 @@ class OITile(nn.Module):
         if self.active_weights is None:
             raise RuntimeError("Call program_weights() before to_analog()")
 
-        tile = deepcopy(self.tile.tile)
+        tile = deepcopy(self.get_analog_tile())
 
         # Independent storage, registered for ordinary PyTorch handling.
         tile.shared_weights = nn.Parameter(
