@@ -1,10 +1,11 @@
 """MNIST training and programming comparison (adapted from PyTorch's example)."""
 
 import argparse
-from datetime import datetime
-import json
+import subprocess
 from pathlib import Path
 from functools import partial
+
+from experiments.history import ExperimentHistory, HistoryRecord
 from time import perf_counter
 
 import torch
@@ -51,8 +52,8 @@ def parse_args(argv=None):
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--save-model', action='store_true')
-    parser.add_argument('--output-dir', help='history/plot directory (default: timestamped results/mnist run)')
-    parser.add_argument('--plot-x', choices=['seconds', 'step', 'epoch'], default='seconds')
+    parser.add_argument('--results-file', default='results/mnist.json')
+    parser.add_argument('--data-dir', default='data')
     parser.add_argument('--train-noise-seed', type=int, default=101)
     parser.add_argument('--validation-noise-seed', type=int, default=202)
     parser.add_argument('--evaluation-noise-seed', type=int, default=303)
@@ -96,8 +97,8 @@ def make_loaders(args, device):
     transform = transforms.Compose([
         transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,)),
     ])
-    train_data = datasets.MNIST('data', train=True, download=True, transform=transform)
-    test_data = datasets.MNIST('data', train=False, download=True, transform=transform)
+    train_data = datasets.MNIST(args.data_dir, train=True, download=True, transform=transform)
+    test_data = datasets.MNIST(args.data_dir, train=False, download=True, transform=transform)
     if args.dry_run:
         train_data = Subset(train_data, range(min(args.batch_size, len(train_data))))
         test_data = Subset(test_data, range(min(args.test_batch_size, len(test_data))))
@@ -148,9 +149,10 @@ def train_digital_epoch(model, loader, device, optimizer, log_interval):
         correct += batch_correct
         count += targets.numel()
         synchronize_device(device)
-        batches.append(dict(batch=batch_index + 1, seconds=perf_counter() - start,
-                            loss=loss.item(), accuracy=batch_correct / targets.numel(),
-                            count=targets.numel()))
+        batches.append(HistoryRecord(
+            batch=batch_index + 1, seconds=perf_counter() - start,
+            loss=loss.item(), accuracy=batch_correct / targets.numel(), count=targets.numel(),
+        ))
         if batch_index % log_interval == 0:
             print(f"Digital batch {batch_index}/{len(loader)}: loss={loss.item():.4f}")
     return dict(loss=total_loss / count, accuracy=correct / count, count=count, batches=batches)
@@ -166,11 +168,11 @@ def train_digital_model(args, train_loader, test_loader, device):
         offset = perf_counter() - start
         training = train_digital_epoch(model, train_loader, device, optimizer, args.log_interval)
         for batch in training['batches']:
-            batch.update(step=(epoch - 1) * len(train_loader) + batch['batch'],
-                         epoch=epoch - 1 + batch['batch'] / len(train_loader),
-                         seconds=offset + batch['seconds'])
+            batch.step = (epoch - 1) * len(train_loader) + batch.batch
+            batch.epoch = epoch - 1 + batch.batch / len(train_loader)
+            batch.seconds += offset
         evaluation = evaluate_classifier(model, test_loader, device)
-        report_metrics(f"Digital epoch {epoch} training", training)
+        report_metrics(f"Digital epoch {epoch} training ({perf_counter() - start:.2f}s)", training)
         report_metrics(f"Digital epoch {epoch} evaluation", evaluation)
         history.append(dict(epoch=epoch, seconds=perf_counter() - start,
                             step=epoch * len(train_loader), training=training, evaluation=evaluation))
@@ -195,9 +197,10 @@ def optimize_oi_batch(oi_model, inputs, targets, realizations, n_times, optimize
             total_loss += loss.item() * targets.numel()
             sample_correct = (output.argmax(dim=-1) == targets).sum().item()
             correct += sample_correct
-            samples.append(dict(realization_id=f'train{realization + 1}', time_index=time_index,
-                                loss=loss.item(), accuracy=sample_correct / targets.numel(),
-                                count=targets.numel()))
+            samples.append(HistoryRecord(
+                realization_id=f'train{realization + 1}', time_index=time_index, batch=0,
+                loss=loss.item(), accuracy=sample_correct / targets.numel(), count=targets.numel(),
+            ))
     optimizer.step()
     oi.clamp_model(oi_model)
     return dict(loss_sum=total_loss, correct=correct, count=targets.numel() * n_samples, samples=samples)
@@ -215,9 +218,11 @@ def optimize_oi_epoch(oi_model, loader, device, realizations, times, optimizer, 
                                   realizations, len(times), optimizer)
         synchronize_device(device)
         elapsed = perf_counter() - start
-        samples.extend(dict(record, batch=batch_index + 1, seconds=elapsed,
-                            t_inference=float(times[record['time_index']]))
-                       for record in batch['samples'])
+        for record in batch['samples']:
+            record.batch = batch_index + 1
+            record.seconds = elapsed
+            record.t_inference = float(times[record.time_index])
+        samples.extend(batch['samples'])
         total_loss += batch['loss_sum']
         correct += batch['correct']
         count += batch['count']
@@ -248,9 +253,9 @@ def optimize_oi(args, analog_model, train_loader, device):
                                     args.times, optimizer, args.log_interval)
         elapsed = perf_counter() - start
         for sample in metrics['samples']:
-            sample.update(step=(epoch - 1) * len(train_loader) + sample['batch'],
-                          epoch=epoch - 1 + sample['batch'] / len(train_loader),
-                          seconds=offset + sample['seconds'])
+            sample.step = (epoch - 1) * len(train_loader) + sample.batch
+            sample.epoch = epoch - 1 + sample.batch / len(train_loader)
+            sample.seconds += offset
         history.append(dict(epoch=epoch, seconds=elapsed, **metrics))
         report_metrics(f"OI epoch {epoch} ({elapsed:.2f}s)", metrics)
     return oi_model, history
@@ -275,22 +280,25 @@ def run_comparison(analog_model, oi_model, loader, device, realization_ids, time
 
 
 
-def save_run(history, output_dir=None, plot_x='seconds'):
-    """Save raw histories before plotting so the figures can be regenerated."""
-    directory = Path(output_dir) if output_dir else Path('results/mnist') / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / 'history.json'
-    path.write_text(json.dumps(history, indent=2, allow_nan=False) + '\n')
-    from experiments.plotting import plot_histories
-    plot_histories(history, directory, x_axis=plot_x)
-    print(f'History and plots saved to {directory}')
-    return directory
+def log_commit():
+    """Identify the source checkout in ordinary stdout logs."""
+    try:
+        commit = subprocess.check_output(
+            ['git', '-C', str(Path(__file__).resolve().parents[1]), 'rev-parse', 'HEAD'],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = 'unknown'
+    print(f'Commit: {commit}', flush=True)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    log_commit()
+    start = perf_counter()
     torch.manual_seed(args.seed)
     device = select_device(args.no_accel)
+    print(f'Device: {torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"}', flush=True)
     train_loader, test_loader = make_loaders(args, device)
     model, digital_history = train_digital_model(args, train_loader, test_loader, device)
     analog_model = convert_to_analog(model, rpu_config=make_rpu_config(args.pair_factors)).to(device)
@@ -300,10 +308,13 @@ def main(argv=None):
         [f'test{i + 1}' for i in range(args.evaluation_realizations)],
         args.times, args.evaluation_noise_seed,
     )
-    history = dict(schema_version=1, config=vars(args),
-                   digital_baseline=digital_history[-1]['evaluation'],
-                   digital_history=digital_history, oi_history=oi_history, results=results)
-    save_run(history, args.output_dir, args.plot_x)
+    history = ExperimentHistory(
+        config=vars(args), digital_baseline=digital_history[-1]['evaluation'],
+        digital_history=digital_history, oi_history=oi_history, results=results,
+    )
+    history.save(args.results_file)
+    print(f'Results: {args.results_file}')
+    print(f'Total runtime: {perf_counter() - start:.2f}s')
     return history
 
 
