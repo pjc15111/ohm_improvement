@@ -1,58 +1,36 @@
-"""MNIST training and programming comparison (adapted from PyTorch's example)."""
+"""MNIST OI optimization and stock evaluation (adapted from PyTorch's example)."""
 
 import argparse
-import subprocess
-from pathlib import Path
 from functools import partial
 
 from experiments.history import ExperimentHistory, HistoryRecord
 from time import perf_counter
 
 import torch
-from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 
-from aihwkit.inference.compensation.drift import GlobalDriftCompensation
-from aihwkit.inference.converter.conductance import NPairConductanceConverter
-from aihwkit.inference.noise.pcm import PCMLikeNoiseModel
 from aihwkit.nn.conversion import convert_to_analog
-from aihwkit.simulator import rpu_base
-from aihwkit.simulator.configs import InferenceRPUConfig
 
 import ohm_improvement as oi
+from experiments.mnist.common import (
+    load_digital_model, log_commit, make_loaders, make_rpu_config, report_metrics,
+    select_device, synchronize_device,
+)
 from experiments.common import (
     evaluate_classifier, evaluate_programming, evaluator_from_analog, evaluator_from_oi,
 )
 
 
-class Net(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.l1 = nn.Linear(784, 64)
-        self.l2 = nn.Linear(64, 10)
-
-    def forward(self, x):
-        x = x.reshape(-1, 28 * 28)
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        return F.log_softmax(x, dim=1)
-
-
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="MNIST programming comparison")
+    parser = argparse.ArgumentParser(description="MNIST OI optimization and evaluation")
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--test-batch-size', type=int, default=1000)
-    parser.add_argument('--epochs', type=int, default=14)
-    parser.add_argument('--lr', type=float, default=1.0)
-    parser.add_argument('--gamma', type=float, default=0.7)
     parser.add_argument('--no-accel', action='store_true')
     parser.add_argument('--dry-run', action='store_true', help='one batch/epoch and one noise/time sample')
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--log-interval', type=int, default=10)
-    parser.add_argument('--save-model', action='store_true')
-    parser.add_argument('--results-file', default='results/mnist.json')
+    parser.add_argument('--checkpoint', default='results/mnist/digital.pt')
+    parser.add_argument('--results-file', default='results/mnist/oi.json')
     parser.add_argument('--data-dir', default='data')
     parser.add_argument('--noise-seed', type=int, default=101)
     parser.add_argument('--oi-epochs', type=int, default=1)
@@ -69,7 +47,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not 0 <= args.noise_seed < 2**63:
         parser.error('noise seed must be an integer in [0, 2**63)')
-    if any(value <= 0 for value in (args.batch_size, args.test_batch_size, args.epochs,
+    if any(value <= 0 for value in (args.batch_size, args.test_batch_size,
                                    args.oi_epochs, args.train_realizations,
                                    args.evaluation_realizations, args.log_interval)):
         parser.error('batch sizes, epochs, realization counts, and log interval must be positive')
@@ -78,105 +56,10 @@ def parse_args(argv=None):
     if any(not 0 < f < float('inf') for f in args.pair_factors):
         parser.error('pair factors must be finite and positive')
     if args.dry_run:
-        args.epochs = args.oi_epochs = 1
+        args.oi_epochs = 1
         args.train_realizations = args.evaluation_realizations = 1
         args.times = args.times[:1]
     return args
-
-
-def select_device(no_accel=False):
-    if not no_accel and torch.cuda.is_available() and rpu_base.cuda.is_compiled():
-        return torch.device('cuda', torch.cuda.current_device())
-    return torch.device('cpu')
-
-
-def make_loaders(args, device):
-    transform = transforms.Compose([
-        transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,)),
-    ])
-    train_data = datasets.MNIST(args.data_dir, train=True, download=True, transform=transform)
-    test_data = datasets.MNIST(args.data_dir, train=False, download=True, transform=transform)
-    if args.dry_run:
-        train_data = Subset(train_data, range(min(args.batch_size, len(train_data))))
-        test_data = Subset(test_data, range(min(args.test_batch_size, len(test_data))))
-    workers = dict(num_workers=1, persistent_workers=True, pin_memory=True) if device.type == 'cuda' else {}
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
-                              generator=torch.Generator().manual_seed(args.seed), **workers)
-    test_loader = DataLoader(test_data, batch_size=args.test_batch_size, shuffle=False, **workers)
-    return train_loader, test_loader
-
-
-def make_rpu_config(pair_factors):
-    config = InferenceRPUConfig()
-    config.noise_model = PCMLikeNoiseModel(
-        g_converter=NPairConductanceConverter(list(pair_factors), g_min=0., g_max=25.),
-    )
-    config.drift_compensation = GlobalDriftCompensation()
-    config.mapping.max_input_size = 0
-    config.mapping.max_output_size = 0
-    config.forward.is_perfect = False
-    return config
-
-
-def report_metrics(label, metrics):
-    print(f"{label}: loss={metrics['loss']:.4f}, accuracy={100 * metrics['accuracy']:.2f}%")
-
-
-def synchronize_device(device):
-    """Include completed GPU work in history timestamps."""
-    if device.type == 'cuda':
-        torch.cuda.synchronize(device)
-
-
-def train_digital_epoch(model, loader, device, optimizer, log_interval):
-    model.train()
-    synchronize_device(device)
-    start = perf_counter()
-    batches = []
-    total_loss, correct, count = 0., 0, 0
-    for batch_index, (inputs, targets) in enumerate(loader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        output = model(inputs)
-        loss = F.nll_loss(output, targets)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * targets.numel()
-        batch_correct = (output.argmax(dim=-1) == targets).sum().item()
-        correct += batch_correct
-        count += targets.numel()
-        synchronize_device(device)
-        batches.append(HistoryRecord(
-            batch=batch_index + 1, seconds=perf_counter() - start,
-            loss=loss.item(), accuracy=batch_correct / targets.numel(), count=targets.numel(),
-        ))
-        if batch_index % log_interval == 0:
-            print(f"Digital batch {batch_index}/{len(loader)}: loss={loss.item():.4f}")
-    return dict(loss=total_loss / count, accuracy=correct / count, count=count, batches=batches)
-
-
-def train_digital_model(args, train_loader, test_loader, device):
-    model = Net().to(device)
-    optimizer = torch.optim.Adadelta(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.gamma)
-    history = []
-    start = perf_counter()
-    for epoch in range(1, args.epochs + 1):
-        offset = perf_counter() - start
-        training = train_digital_epoch(model, train_loader, device, optimizer, args.log_interval)
-        for batch in training['batches']:
-            batch.step = (epoch - 1) * len(train_loader) + batch.batch
-            batch.epoch = epoch - 1 + batch.batch / len(train_loader)
-            batch.seconds += offset
-        evaluation = evaluate_classifier(model, test_loader, device)
-        report_metrics(f"Digital epoch {epoch} training ({perf_counter() - start:.2f}s)", training)
-        report_metrics(f"Digital epoch {epoch} evaluation", evaluation)
-        history.append(dict(epoch=epoch, seconds=perf_counter() - start,
-                            step=epoch * len(train_loader), training=training, evaluation=evaluation))
-        scheduler.step()
-    if args.save_model:
-        torch.save(model.state_dict(), 'mnist_nn.pt')
-    return model.eval(), history
 
 
 def optimize_oi_batch(oi_model: oi.OIModel, inputs, targets, realization_ids, times, optimizer):
@@ -197,7 +80,7 @@ def optimize_oi_batch(oi_model: oi.OIModel, inputs, targets, realization_ids, ti
             correct += sample_correct
             samples.append(HistoryRecord(
                 realization_id=realization_id, time_index=time_index, batch=0,
-                loss=loss.item(), accuracy=sample_correct / targets.numel(), count=targets.numel(),
+                metrics=dict(loss=loss.item(), accuracy=sample_correct / targets.numel()), count=targets.numel(),
             ))
     optimizer.step()
     oi_model.clamp()
@@ -273,19 +156,6 @@ def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, d
     return results
 
 
-
-def log_commit():
-    """Identify the source checkout in ordinary stdout logs."""
-    try:
-        commit = subprocess.check_output(
-            ['git', '-C', str(Path(__file__).resolve().parents[1]), 'rev-parse', 'HEAD'],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        commit = 'unknown'
-    print(f'Commit: {commit}', flush=True)
-
-
 def main(argv=None):
     args = parse_args(argv)
     log_commit()
@@ -293,8 +163,10 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     device = select_device(args.no_accel)
     print(f'Device: {torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"}', flush=True)
+    model = load_digital_model(args.checkpoint, device)
     train_loader, test_loader = make_loaders(args, device)
-    model, digital_history = train_digital_model(args, train_loader, test_loader, device)
+    digital_baseline = evaluate_classifier(model, test_loader, device)
+    report_metrics('Digital baseline', digital_baseline)
     analog_model = convert_to_analog(model, rpu_config=make_rpu_config(args.pair_factors)).to(device)
     oi_model, oi_history = optimize_oi(args, analog_model, train_loader, device)
     results = run_comparison(
@@ -303,8 +175,8 @@ def main(argv=None):
         args.times, args.noise_seed,
     )
     history = ExperimentHistory(
-        config=vars(args), digital_baseline=digital_history[-1]['evaluation'],
-        digital_history=digital_history, oi_history=oi_history, results=results,
+        method='oi', config=vars(args), digital_baseline=digital_baseline,
+        optimization_history=oi_history, results=results,
     )
     history.save(args.results_file)
     print(f'Results: {args.results_file}')
