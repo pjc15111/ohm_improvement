@@ -57,8 +57,22 @@ Adam does not replace explicit group rates. In MNIST, `--oi-lr` (also
 `--conductance-lr`) sets only conductance LR; `--significance-lr` sets significance
 LR. Bias and output scaling remain excluded from MNIST optimization.
 
+## Convolution and mapped arrays
+
+OI uses AIHWKIT's unfolded `Conv2d` path, including mapped convolutions and
+linear layers split across input/output dimensions. Conversion disables indexing,
+including when the source model has already run an indexed forward. Digital bias
+owned by a mapped array is included when `include_bias=True`.
+
+Compatibility tests cover residual CNN blocks, a two-layer AIHWKIT LSTM, and
+BERT-style attention/projections with digital embeddings and layer norms. These
+are small structural tests; full paper-model experiments remain to be added.
+
 ## Known Limitations
 
+- Indexed execution is unsupported, including AIHWKIT's `Conv1d` and `Conv3d`.
+  Unfolded `Conv2d` can require more memory than indexed simulation; AIHWKIT's
+  restrictions on convolution groups and padding modes still apply.
 - OI supports AIHWKIT `InferenceTile` with shared weights, stock `PCMLikeNoiseModel`,
   and global drift compensation (or no compensation). Other tile/noise types and
   compensation variants are unsupported; disabling the noise model is unsupported.
@@ -87,12 +101,3 @@ MNIST retains dataclass history records for digital training and every OI
 realization/time at each optimizer step. Final stock evaluations and histories
 are saved to `results/mnist.json`; use `--results-file PATH` to choose a file.
 The commit hash, device, metrics, and runtimes are printed to the log.
-
-For 15 independent SLURM runs on available GPUs:
-
-```bash
-bash scripts/submit_mnist_gpu_comparison.sh
-```
-
-Each run writes `results/mnist/JOB_TASK.log` and `JOB_TASK.json`. The runner uses
-the current checkout. There are no source archives, manifests, or automatic plots.
