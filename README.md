@@ -97,7 +97,96 @@ are small structural tests; full paper-model experiments remain to be added.
 
 ## Histories and results
 
-MNIST retains dataclass history records for digital training and every OI
-realization/time at each optimizer step. Final stock evaluations and histories
-are saved to `results/mnist.json`; use `--results-file PATH` to choose a file.
-The commit hash, device, metrics, and runtimes are printed to the log.
+All MNIST experiment code lives in `experiments/mnist`.
+Train the shared digital baseline, then optimize OI:
+
+```bash
+python -m experiments.mnist.digital --epochs 3 --seed 1
+python -m experiments.mnist.oi --seed 1
+```
+
+The standalone programs save to `results/mnist`: digital weights in `digital.pt`,
+training history in `digital.json`, and OI history/evaluations in `oi.json`.
+Use `--checkpoint` and `--results-file` to override these paths; `--help` lists
+training and optimization options. Commit hash, device, metrics, and runtimes
+are printed to the log.
+
+To submit five paired seeds on SLURM:
+
+```bash
+bash experiments/mnist/submit.sh
+```
+
+Digital training runs on GPUs for 14 epochs, followed by five OI epochs by default.
+Each WPO job requests 64 physical CPU cores (`--hint=nomultithread`). Each CPU WPO task
+can start as soon as its matching digital task succeeds. OI GPU tasks wait for
+**all** digital tasks to succeed, so OI cannot hold GPUs needed by the remaining
+baselines. No GPU type or concurrency limit is imposed. The scripts use the
+repository's `venv` and current checkout.
+
+Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS`, `HAT_EPOCHS` (default five),
+`GPU_PARTITION` (default `general-gpu`),
+`CPU_PARTITION` (default `general`), `GPU_TIME` (default `00:15:00`), or `WPO_TIME`
+(default `04:00:00`) before submission to override settings. `MNIST_DATA` can
+select an existing shared dataset directory; otherwise the scripts use `data`.
+
+The wrapper prints job IDs and a directory under `results/mnist/run-*`.
+Each `seed-N` directory contains `digital.log`, `oi.log`, `wpo.log`, and their
+history JSON files. Temporary checkpoints are removed by a final cleanup job,
+even after a failed stage. Only logs and histories are retained.
+
+The WPO command loads the same checkpoint, optionally fine-tunes a copy with HAT,
+then runs stock AIHWKIT WPO on CPU. It learns one shared conductance converter
+from the pooled, per-tile-normalized nominal weight distribution. Bias and output
+scaling are excluded from that distribution. Final stock evaluations compare
+`baseline` and `wpo`, plus `hat` when HAT is enabled, at the same `testN`
+realizations/times and noise seed as OI. The original models are preserved.
+
+```bash
+python -m experiments.mnist.wpo --no-accel --hat-epochs 5
+```
+
+WPO defaults to 200 generations, population multiplier 100, six positive-side
+bins, and 100 baseline-loss samples, retaining stock stopping/polishing settings.
+Its synthetic test array is 512 inputs by 20 outputs; this is independent of the
+inference model's unmapped-array setting. Use `--wpo-maxiter`, `--wpo-popsize`,
+`--wpo-bins`, `--wpo-baseline-iterations`, `--wpo-input-size`, `--wpo-output-size`,
+and `--no-wpo-polish` to change search cost. Pair factors are fixed by default;
+`--optimize-significance` lets WPO optimize shared factors. `--dry-run` uses a
+small one-generation search with polishing disabled.
+
+`--workers` defaults to `SLURM_CPUS_PER_TASK` (64 in the wrapper), otherwise one.
+Parallel workers are spawned with one compute thread each and independent
+PyTorch/NumPy seed streams. Search/distribution sampling uses `--seed`;
+PCM sampling/evaluation uses `--noise-seed`. Parallel scheduling and AIHWKIT's
+separate backend RNG still prevent guaranteed bitwise repeatability.
+
+The callback records stock objective/TNMSE each generation. It evaluates the
+first generation and then every `--evaluation-interval` optimization seconds
+(default 60), checked at generation boundaries. `--progress-realizations`
+defaults to one; progress uses `validationN` noise realizations, separate from
+final `testN` realizations. Classification metrics are reporting only, without
+changing WPO's weight-error objective or stopping rule. Progress-evaluation time
+is tracked separately and excluded from history timestamps for optimization.
+
+History is saved after every generation so interrupted jobs retain progress.
+`config.stage` records `optimization`, `evaluation`, or `complete`. The final
+converter's pair factors and conductance curves are included in
+`config.wpo_converter`; no additional result artifacts are written.
+
+Standalone HAT defaults to off (`--hat-epochs 0`); the SLURM wrapper runs five
+HAT epochs by default. For example, `HAT_EPOCHS=0 bash experiments/mnist/submit.sh`
+skips HAT. When enabled, it uses `AnalogSGD` with
+learning rate 0.01, momentum 0.9, and epoch LR decay 0.7. Training weight noise
+has standard deviation 0.1 relative to each tile's maximum, with clipping at
+2.5 standard deviations. These are configurable starting settings, not a
+paper-matched recipe. See `--hat-lr`, `--hat-momentum`, `--hat-gamma`,
+`--hat-weight-noise`, and `--hat-clip-sigma`. Test-set metrics during HAT are
+reporting only, without early stopping or model selection. The original baseline
+is preserved; the prepared model returns to CPU with HAT modifiers disabled.
+
+History records hold named `metrics` and optional batch/epoch/sample information,
+so optimization steps can also represent WPO generations. Each experiment saves
+its `method` and `optimization_history`; digital training history is optional for
+jobs loading a shared checkpoint. This replaces the old `oi_history` JSON key and
+moves record loss/accuracy into `metrics`.

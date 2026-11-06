@@ -15,6 +15,7 @@ import math
 import multiprocessing
 import os
 import random
+import warnings
 from time import perf_counter
 
 import numpy as np
@@ -388,7 +389,15 @@ def optimize_wpo(
                 on_progress=on_progress, started=started,
             )
             optimizer.callback = callback
-            converter, _ = optimizer.run_optimizer()
+            # Stock WPO requests immediate updates for custom worker maps.
+            # SciPy correctly enforces deferred updates; silence only its notice.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore', category=UserWarning,
+                    message="^differential_evolution: the 'workers' keyword has overridden "
+                            "updating='immediate' to updating='deferred'$",
+                )
+                converter, _ = optimizer.run_optimizer()
         seconds = callback.seconds()
         callback.history.append(HistoryRecord(
             metrics=dict(tnmse=float(optimizer.best_loss), baseline_tnmse=float(optimizer.loss_baseline),

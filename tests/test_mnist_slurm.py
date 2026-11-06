@@ -6,11 +6,13 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
 
 MNIST = Path(__file__).resolve().parents[1] / 'experiments' / 'mnist'
 
 
-def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path):
+@pytest.mark.parametrize('hat_epochs', [None, '0', '2'])
+def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs):
     # A copied checkout keeps generated result directories inside this test.
     folder = tmp_path / 'experiments' / 'mnist'
     folder.mkdir(parents=True)
@@ -30,7 +32,9 @@ print(1000 + len(path.read_text().splitlines()))
 ''')
     sbatch.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
-           if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS'}}
+           if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS'}}
+    if hat_epochs is not None:
+        env['HAT_EPOCHS'] = hat_epochs
     env.update({'PATH': f'{bin_dir}:{os.environ["PATH"]}',
            'SBATCH_CALLS': str(calls_file),
            'GPU_PARTITION': 'test-gpu', 'CPU_PARTITION': 'test-cpu'})
@@ -52,6 +56,7 @@ print(1000 + len(path.read_text().splitlines()))
     assert '--hint=nomultithread' in wpo
     assert digital[-1] == '14'
     assert oi[-1] == '5'
+    assert wpo[-1] == ('5' if hat_epochs is None else hat_epochs)
     assert not any(arg.startswith('--gres') for arg in wpo)
 
     run_dir = next((tmp_path / 'results' / 'mnist').glob('run-*'))

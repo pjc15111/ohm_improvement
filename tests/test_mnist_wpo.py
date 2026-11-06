@@ -214,8 +214,7 @@ def test_stock_wpo_with_spawned_workers_and_progress_history():
     saves = []
     threads = torch.get_num_threads()
     environment = {key: os.environ.get(key) for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')}
-    with pytest.warns(UserWarning, match='workers.*updating'):
-        converter, history = wpo.optimize_wpo(args, analog, None, on_progress=lambda rows: saves.append(len(rows)))
+    converter, history = wpo.optimize_wpo(args, analog, None, on_progress=lambda rows: saves.append(len(rows)))
     assert torch.get_num_threads() == threads
     assert {key: os.environ.get(key) for key in environment} == environment
     assert len(converter.g_lst) == 2 and len(converter.f_lst) == 1
@@ -259,6 +258,7 @@ def test_module_command_with_real_workers_and_offline_mnist(tmp_path):
        env={**os.environ, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1'},
        timeout=60)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "has overridden updating='immediate'" not in completed.stderr
     history = json.loads(results.read_text())
     assert history['config']['stage'] == 'complete'
     assert history['config']['workers'] == 2

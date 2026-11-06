@@ -6,6 +6,7 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runs=${RUNS:-5}
 epochs=${DIGITAL_EPOCHS:-14}
 oi_epochs=${OI_EPOCHS:-5}
+hat_epochs=${HAT_EPOCHS:-5}
 gpu_partition=${GPU_PARTITION:-general-gpu}
 cpu_partition=${CPU_PARTITION:-general}
 gpu_time=${GPU_TIME:-00:15:00}
@@ -13,6 +14,10 @@ wpo_time=${WPO_TIME:-04:00:00}
 
 if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ ]]; then
     echo 'RUNS, DIGITAL_EPOCHS, and OI_EPOCHS must be positive integers' >&2
+    exit 1
+fi
+if [[ ! $hat_epochs =~ ^[0-9]+$ ]]; then
+    echo 'HAT_EPOCHS must be a nonnegative integer' >&2
     exit 1
 fi
 
@@ -43,7 +48,7 @@ digital=$(submit "${array[@]}" "${resources[@]}" \
 wpo=$(submit "${array[@]}" "${resources[@]}" \
     --dependency="aftercorr:$digital" --job-name=mnist-wpo \
     --partition="$cpu_partition" --cpus-per-task=64 --hint=nomultithread --time="$wpo_time" \
-    --output="$run_dir/seed-%a/wpo.log" "$runner" wpo "$run_dir")
+    --output="$run_dir/seed-%a/wpo.log" "$runner" wpo "$run_dir" "$hat_epochs")
 
 # Finish every digital GPU job before allowing any OI GPU job to start.
 oi=$(submit "${array[@]}" "${resources[@]}" \

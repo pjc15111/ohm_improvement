@@ -34,7 +34,7 @@ case "$phase" in
         "$python_bin" -m experiments.mnist.oi "${args[@]}" --noise-seed "$((100 + seed))" --oi-epochs "$3"
         ;;
     wpo)
-        "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + seed))" --no-accel
+        "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + seed))" --no-accel --hat-epochs "$3"
         ;;
     *)
         echo "Unknown MNIST phase: $phase" >&2
