@@ -4,6 +4,7 @@ from aihwkit.simulator.tiles.inference import (
     InferenceTile
 )
 import hashlib
+import math
 
 import torch.nn as nn
 import torch
@@ -112,29 +113,49 @@ def clamp_model(model: nn.Module) -> None:
 
 
 def optimization_parameters(
-    model,
+    model: nn.Module,
     include_conductances=True,
     include_output_scaling=True,
     include_bias=False,
-    include_significance=True
-):
-    parameters = []
+    include_significance=True,
+    *,
+    conductance_lr: float = 0.01,
+    significance_lr: float = 0.0001,
+    bias_lr: float = 0.0001,
+    output_scaling_lr: float = 0.0001,
+) -> list[dict]:
+    """Return named parameter groups ready for torch.optim.Adam.
+
+    Each group has its own learning rate; passing lr to Adam does not override
+    these explicit rates. Use the keyword overrides here instead. Excluded,
+    absent, and frozen parameters are omitted, as are empty groups.
+    """
+    groups = {
+        "conductances": dict(params=[], lr=conductance_lr),
+        "significance": dict(params=[], lr=significance_lr),
+        "bias": dict(params=[], lr=bias_lr),
+        "output_scaling": dict(params=[], lr=output_scaling_lr),
+    }
+    for name, group in groups.items():
+        if not math.isfinite(group["lr"]) or group["lr"] < 0:
+            raise ValueError(f"{name} learning rate must be finite and nonnegative")
 
     for tile in model.modules():
         if not isinstance(tile, OITile):
             continue
-
         if include_conductances:
-            parameters.extend(tile.g_plus)
-            parameters.extend(tile.g_minus)
-
-        if include_output_scaling and tile.out_scaling_alpha is not None:
-            parameters.append(tile.out_scaling_alpha)
-
-        if include_bias and tile.digital_bias:
-            parameters.append(tile.bias)
-
+            groups["conductances"]["params"].extend(tile.g_plus)
+            groups["conductances"]["params"].extend(tile.g_minus)
         if include_significance and tile.significance is not None:
-            parameters.append(tile.significance)
+            groups["significance"]["params"].append(tile.significance)
+        if include_bias and tile.digital_bias:
+            groups["bias"]["params"].append(tile.bias)
+        if include_output_scaling and tile.out_scaling_alpha is not None:
+            groups["output_scaling"]["params"].append(tile.out_scaling_alpha)
 
-    return parameters
+    result = []
+    for name, group in groups.items():
+        parameters = [p for p in group["params"] if p.requires_grad]
+        if parameters:
+            result.append(dict(name=name, params=parameters, lr=group["lr"]))
+    return result

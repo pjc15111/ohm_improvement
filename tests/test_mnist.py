@@ -41,7 +41,8 @@ def test_oi_batch_updates_only_selected_parameters():
     bias = tile.bias.detach().clone()
     significance = tile.significance.detach().clone()
     optimizer = torch.optim.Adam(optimization_parameters(
-        model, include_output_scaling=False, include_bias=False, include_significance=False), lr=.01)
+        model, include_output_scaling=False, include_bias=False, include_significance=False,
+        conductance_lr=.01))
     metrics = mnist.optimize_oi_batch(model.eval(), torch.tensor([[.2, -.4, .8], [.1, .3, -.2]]),
                                       torch.tensor([0, 1]), range(2), 2, optimizer)
     assert metrics['count'] == 8

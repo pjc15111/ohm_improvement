@@ -57,7 +57,11 @@ def parse_args(argv=None):
     parser.add_argument('--validation-noise-seed', type=int, default=202)
     parser.add_argument('--evaluation-noise-seed', type=int, default=303)
     parser.add_argument('--oi-epochs', type=int, default=1)
-    parser.add_argument('--oi-lr', type=float, default=0.01)
+    parser.add_argument('--oi-lr', '--conductance-lr', dest='oi_lr', type=float, default=0.01,
+                        help='OI conductance learning rate')
+    parser.add_argument('--significance-lr', type=float, default=0.0001)
+    parser.add_argument('--bias-lr', type=float, default=0.0001)
+    parser.add_argument('--output-scaling-lr', type=float, default=0.0001)
     parser.add_argument('--train-realizations', type=int, default=4)
     parser.add_argument('--evaluation-realizations', type=int, default=4)
     parser.add_argument('--times', type=float, nargs='+', default=[86400, 30 * 86400, 365 * 86400])
@@ -232,8 +236,10 @@ def optimize_oi(args, analog_model, train_loader, device):
     parameters = oi.optimization_parameters(
         oi_model, include_conductances=True, include_output_scaling=False,
         include_bias=False, include_significance=args.optimize_significance,
+        conductance_lr=args.oi_lr, significance_lr=args.significance_lr,
+        bias_lr=args.bias_lr, output_scaling_lr=args.output_scaling_lr,
     )
-    optimizer = torch.optim.Adam(parameters, lr=args.oi_lr)
+    optimizer = torch.optim.Adam(parameters)
     history = []
     start = perf_counter()
     for epoch in range(1, args.oi_epochs + 1):

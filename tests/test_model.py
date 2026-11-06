@@ -94,7 +94,9 @@ def test_parameter_selection_returns_exact_group(option):
         expected = [tile.significance for tile in tiles]
 
     actual = optimization_parameters(model, **options)
-    assert [id(p) for p in actual] == [id(p) for p in expected]
+    assert len(actual) == 1
+    assert actual[0]["name"] == option.removeprefix("include_")
+    assert [id(p) for p in actual[0]["params"]] == [id(p) for p in expected]
 
 
 def test_absent_optional_parameters_are_not_returned():
@@ -216,3 +218,45 @@ def test_default_noise_seeds_follow_manual_seed():
     second = convert_to_oi(analog, 1, [0.])
     for a, b in zip(oi_tiles(first), oi_tiles(second)):
         torch.testing.assert_close(a.noise_seeds, b.noise_seeds)
+
+
+
+@pytest.mark.parametrize("overrides", [{}, dict(conductance_lr=.003, significance_lr=.0002,
+                                               bias_lr=.0003, output_scaling_lr=.0004)])
+def test_optimizer_groups_apply_independent_learning_rates(overrides):
+    model = convert_to_oi(make_model(), 1, [0.])
+    groups = optimization_parameters(model, include_bias=True, **overrides)
+    expected = dict(conductances=overrides.get("conductance_lr", .01),
+                    significance=overrides.get("significance_lr", .0001),
+                    bias=overrides.get("bias_lr", .0001),
+                    output_scaling=overrides.get("output_scaling_lr", .0001))
+    assert {g["name"]: g["lr"] for g in groups} == expected
+    parameters = [p for g in groups for p in g["params"]]
+    assert len({id(p) for p in parameters}) == len(parameters)
+    # Equal gradients make Adam's first update approximately equal to each
+    # group's LR, verifying that the returned groups actually drive updates.
+    before = {id(p): p.detach().clone() for p in parameters}
+    for p in parameters:
+        p.grad = torch.ones_like(p)
+    optimizer = torch.optim.Adam(groups)
+    optimizer.step()
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            torch.testing.assert_close(before[id(p)] - p, torch.full_like(p, group["lr"]),
+                                       atol=2e-6, rtol=1e-3)
+
+
+def test_optimizer_groups_omit_frozen_parameters():
+    model = convert_to_oi(make_model(), 1, [0.])
+    for tile in oi_tiles(model):
+        tile.significance.requires_grad_(False)
+        tile.out_scaling_alpha.requires_grad_(False)
+    groups = optimization_parameters(model)
+    assert [group["name"] for group in groups] == ["conductances"]
+
+
+@pytest.mark.parametrize("rate", [-1., float("nan"), float("inf")])
+def test_optimizer_groups_reject_invalid_learning_rates(rate):
+    model = convert_to_oi(make_model(), 1, [0.])
+    with pytest.raises(ValueError, match="learning rate"):
+        optimization_parameters(model, significance_lr=rate)
