@@ -35,6 +35,24 @@ checkpoints containing full noise buffers require migration before strict loadin
 `experiments/mnist.py` exposes `--train-noise-seed`, `--validation-noise-seed`,
 and `--evaluation-noise-seed` (defaults 101, 202, 303).
 
+## Optimizer parameter groups
+
+`optimization_parameters()` returns named groups ready for Adam:
+
+```python
+optimizer = torch.optim.Adam(oi.optimization_parameters(
+    model, conductance_lr=0.01, significance_lr=0.0001,
+    include_bias=False, include_output_scaling=False,
+))
+```
+
+Defaults are `conductance_lr=0.01`, `significance_lr=0.0001`, `bias_lr=0.0001`,
+and `output_scaling_lr=0.0001`. Inclusion switches are unchanged; frozen and
+absent parameters are omitted. Override rates in this helper: an `lr` passed to
+Adam does not replace explicit group rates. In MNIST, `--oi-lr` (also
+`--conductance-lr`) sets only conductance LR; `--significance-lr` sets significance
+LR. Bias and output scaling remain excluded from MNIST optimization.
+
 ## Known Limitations
 
 - OI supports AIHWKIT `InferenceTile` with shared weights, stock `PCMLikeNoiseModel`,
@@ -61,23 +79,18 @@ and `--evaluation-noise-seed` (defaults 101, 202, 303).
   comparisons remain to be added. Installed stock WPO optimization runs on CPU;
   custom-converter initialization also uses CPU interpolation.
 
-## Histories and plots
+## Histories and results
 
-MNIST saves `history.json` and PNG/PDF figures under a timestamped
-`results/mnist/` directory; set `--output-dir PATH` to choose the location.
-Histories contain run configuration, digital batch/epoch metrics, OI metrics for
-every realization/time at each optimizer step, and final stock evaluations.
+MNIST retains dataclass history records for digital training and every OI
+realization/time at each optimizer step. Final stock evaluations and histories
+are saved to `results/mnist.json`; use `--results-file PATH` to choose a file.
+The commit hash, device, metrics, and runtimes are printed to the log.
 
-Plots include digital loss/accuracy; optimization loss/accuracy overall, by drift
-time, by realization, and by both; and final stock inference curves by method.
-Optimization plots show minibatch training metrics before each update, not
-held-out performance. Dotted lines show the final digital evaluation baseline;
-loss figures include digital loss and digital accuracy on a labeled right axis.
-Future WPO evaluation records will appear alongside other methods automatically.
-
-Use `--plot-x seconds|step|epoch` to select the optimization x-axis (default:
-seconds). Regenerate plots without retraining:
+For 15 independent SLURM runs on available GPUs:
 
 ```bash
-python -m experiments.plotting results/mnist/RUN/history.json --x-axis step
+bash scripts/submit_mnist_gpu_comparison.sh
 ```
+
+Each run writes `results/mnist/JOB_TASK.log` and `JOB_TASK.json`. The runner uses
+the current checkout. There are no source archives, manifests, or automatic plots.
