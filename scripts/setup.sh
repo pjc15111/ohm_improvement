@@ -27,4 +27,7 @@ python -m pip install --only-binary=:all: \
     --extra-index-url https://download.pytorch.org/whl/cu126 \
     'torch==2.10.0+cu126' \
     'https://aihwkit-gpu-demo.s3.us-east.cloud-object-storage.appdomain.cloud/aihwkit-1.1.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl'
+
+python -m pip install -r "$repo_dir/requirements.txt"
+
 python -m pip check

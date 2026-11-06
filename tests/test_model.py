@@ -1,0 +1,184 @@
+import pytest
+import torch
+from torch import nn
+
+from aihwkit.nn.conversion import convert_to_analog
+from aihwkit.inference.compensation.drift import GlobalDriftCompensation
+from aihwkit.inference.converter.conductance import NPairConductanceConverter
+from aihwkit.simulator.configs import InferenceRPUConfig
+
+from ohm_improvement.model import (
+    convert_to_oi,
+    oi_to_analog,
+    program_weights,
+    optimization_parameters,
+    clamp_model,
+)
+from ohm_improvement.tiles import OITile
+
+
+def make_model(bias=True, scaling=True):
+    torch.manual_seed(12)
+    digital = nn.Sequential(
+        nn.Sequential(nn.Linear(3, 4, bias=bias), nn.Tanh()),
+        nn.Linear(4, 2, bias=bias),
+    ).eval()
+
+    config = InferenceRPUConfig()
+    config.forward.is_perfect = True
+    config.mapping.max_input_size = 0
+    config.mapping.max_output_size = 0
+    config.mapping.learn_out_scaling = scaling
+    config.mapping.weight_scaling_omega = 0.7 if scaling else 0.0
+    config.drift_compensation = GlobalDriftCompensation()
+    config.noise_model.g_converter = NPairConductanceConverter([1.0, 2.0])
+    config.noise_model.prog_noise_scale = 0.0
+    config.noise_model.drift_scale = 0.0
+    config.noise_model.read_noise_scale = 0.0
+
+    analog = convert_to_analog(digital, rpu_config=config).eval()
+    return analog
+
+
+def oi_tiles(model):
+    return [module for module in model.modules() if isinstance(module, OITile)]
+
+
+def test_nested_conversion_and_model_programming():
+    original = make_model()
+    converted = convert_to_oi(original, 2, [0.0, 86400.0]).eval()
+
+    assert converted is not original
+    assert len(oi_tiles(converted)) == 2
+    assert not oi_tiles(original)
+    assert all(tile.active_weights is None for tile in oi_tiles(converted))
+
+    program_weights(converted, 1, 1)
+    assert all(tile.active_weights is not None for tile in oi_tiles(converted))
+
+    x = torch.tensor([[0.2, -0.3, 0.8], [-0.1, 0.7, 0.4]])
+    torch.testing.assert_close(
+        converted(x), original(x), atol=3e-6, rtol=3e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["include_conductances", "include_output_scaling",
+     "include_bias", "include_significance"],
+)
+def test_parameter_selection_returns_exact_group(option):
+    model = convert_to_oi(make_model(), 1, [0.0])
+    tiles = oi_tiles(model)
+    options = {
+        "include_conductances": False,
+        "include_output_scaling": False,
+        "include_bias": False,
+        "include_significance": False,
+    }
+    options[option] = True
+
+    if option == "include_conductances":
+        expected = [
+            p for tile in tiles for side in (tile.g_plus, tile.g_minus)
+            for p in side
+        ]
+    elif option == "include_output_scaling":
+        expected = [
+            tile.out_scaling_alpha for tile in tiles
+            if tile.out_scaling_alpha is not None
+        ]
+    elif option == "include_bias":
+        expected = [tile.bias for tile in tiles]
+    else:
+        expected = [tile.significance for tile in tiles]
+
+    actual = optimization_parameters(model, **options)
+    assert [id(p) for p in actual] == [id(p) for p in expected]
+
+
+def test_absent_optional_parameters_are_not_returned():
+    model = convert_to_oi(make_model(bias=False, scaling=False), 1, [0.0])
+
+    actual = optimization_parameters(
+        model,
+        include_conductances=False,
+        include_output_scaling=True,
+        include_bias=True,
+        include_significance=False,
+    )
+    assert actual == []
+
+
+def test_model_clamping_reaches_every_tile():
+    model = convert_to_oi(make_model(), 1, [0.0])
+    with torch.no_grad():
+        for tile in oi_tiles(model):
+            for g in tile.g_plus:
+                g.fill_(-2.0)
+            for g in tile.g_minus:
+                g.fill_(100.0)
+            tile.significance.fill_(9.0)
+
+    clamp_model(model)
+
+    for tile in oi_tiles(model):
+        for g in tile.g_plus:
+            torch.testing.assert_close(
+                g, torch.full_like(g, tile.g_converter.g_min)
+            )
+        for g in tile.g_minus:
+            torch.testing.assert_close(
+                g, torch.full_like(g, tile.g_converter.g_max)
+            )
+        torch.testing.assert_close(
+            tile.significance, torch.full_like(tile.significance, 5.0)
+        )
+
+
+def test_export_does_not_copy_graphs_or_mutate_original():
+    model = convert_to_oi(make_model(), 1, [0.0]).eval()
+    program_weights(model, 0, 0)
+    tiles = oi_tiles(model)
+
+    # Export must work with live non-leaf tensors on the OITiles.
+    assert all(tile.active_weights.grad_fn is not None for tile in tiles)
+    active_ids = [id(tile.active_weights) for tile in tiles]
+
+    x = torch.tensor([[0.2, -0.3, 0.8]])
+    expected = model(x).detach().clone()
+    exported = oi_to_analog(model)
+
+    assert exported is not model
+    assert not oi_tiles(exported)
+    assert oi_tiles(model) == tiles
+    assert [id(tile.active_weights) for tile in tiles] == active_ids
+    torch.testing.assert_close(
+        exported(x), expected, atol=3e-6, rtol=3e-5
+    )
+
+    # The source graph remains usable after export.
+    model(x).square().sum().backward()
+    for tile in tiles:
+        for g in [*tile.g_plus, *tile.g_minus]:
+            assert g.grad is not None
+            assert torch.isfinite(g.grad).all()
+
+    # Exported parameters must not alias the source model's parameters.
+    with torch.no_grad():
+        for parameter in exported.parameters():
+            parameter.zero_()
+
+    torch.testing.assert_close(
+        model(x), expected, atol=3e-6, rtol=3e-5
+    )
+
+
+def test_inplace_export_preserves_outer_model_identity():
+    model = convert_to_oi(make_model(), 1, [0.0]).eval()
+    program_weights(model, 0, 0)
+
+    exported = oi_to_analog(model, inplace=True)
+
+    assert exported is model
+    assert not oi_tiles(model)

@@ -127,7 +127,7 @@ def optimization_parameters(
         if include_bias and tile.digital_bias:
             parameters.append(tile.bias)
 
-        if include_significance and tile.significance:
+        if include_significance and tile.significance is not None:
             parameters.append(tile.significance)
 
     return parameters
