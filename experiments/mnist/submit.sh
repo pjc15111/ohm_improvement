@@ -11,6 +11,7 @@ gpu_partition=${GPU_PARTITION:-general-gpu}
 cpu_partition=${CPU_PARTITION:-general}
 gpu_time=${GPU_TIME:-00:15:00}
 wpo_time=${WPO_TIME:-04:00:00}
+wpo_mem=${WPO_MEM:-64G}
 
 if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ ]]; then
     echo 'RUNS, DIGITAL_EPOCHS, and OI_EPOCHS must be positive integers' >&2
@@ -31,7 +32,7 @@ done
 cd "$repo_dir"
 runner=$repo_dir/experiments/mnist/run.slurm
 array=(--array="1-$runs" --kill-on-invalid-dep=yes)
-resources=(--nodes=1 --ntasks=1 --mem=16G --chdir="$repo_dir")
+resources=(--nodes=1 --ntasks=1 --chdir="$repo_dir")
 
 submit() {
     local job_id
@@ -41,19 +42,19 @@ submit() {
 
 digital=$(submit "${array[@]}" "${resources[@]}" \
     --job-name=mnist-digital --partition="$gpu_partition" --gres=gpu:1 \
-    --cpus-per-task=4 --time="$gpu_time" --output="$run_dir/seed-%a/digital.log" \
+    --cpus-per-task=4 --mem=16G --time="$gpu_time" --output="$run_dir/seed-%a/digital.log" \
     "$runner" digital "$run_dir" "$epochs")
 
 # Each WPO seed can start on CPUs as soon as its own baseline finishes.
 wpo=$(submit "${array[@]}" "${resources[@]}" \
     --dependency="aftercorr:$digital" --job-name=mnist-wpo \
-    --partition="$cpu_partition" --cpus-per-task=64 --hint=nomultithread --time="$wpo_time" \
+    --partition="$cpu_partition" --cpus-per-task=64 --hint=nomultithread --mem="$wpo_mem" --time="$wpo_time" \
     --output="$run_dir/seed-%a/wpo.log" "$runner" wpo "$run_dir" "$hat_epochs")
 
 # Finish every digital GPU job before allowing any OI GPU job to start.
 oi=$(submit "${array[@]}" "${resources[@]}" \
     --dependency="afterok:$digital" --job-name=mnist-oi \
-    --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --time="$gpu_time" \
+    --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --mem=16G --time="$gpu_time" \
     --output="$run_dir/seed-%a/oi.log" "$runner" oi "$run_dir" "$oi_epochs")
 
 # Checkpoints are only a handoff between stages; retain logs and histories.

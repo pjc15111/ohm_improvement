@@ -129,6 +129,10 @@ Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS`, `HAT_EPOCHS` (default five),
 `CPU_PARTITION` (default `general`), `GPU_TIME` (default `00:15:00`), or `WPO_TIME`
 (default `04:00:00`) before submission to override settings. `MNIST_DATA` can
 select an existing shared dataset directory; otherwise the scripts use `data`.
+WPO requests 64 GB per job by default, independently of the GPU jobs' 16 GB;
+override with `WPO_MEM`, for example `WPO_MEM=128G bash experiments/mnist/submit.sh`.
+Spawned workers each load Python/AIHWKIT, so memory usage grows with worker count;
+the larger default is a starting allocation, not a measured peak requirement.
 
 The wrapper prints job IDs and a directory under `results/mnist/run-*`.
 Each `seed-N` directory contains `digital.log`, `oi.log`, `wpo.log`, and their

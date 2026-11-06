@@ -12,7 +12,8 @@ MNIST = Path(__file__).resolve().parents[1] / 'experiments' / 'mnist'
 
 
 @pytest.mark.parametrize('hat_epochs', [None, '0', '2'])
-def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs):
+@pytest.mark.parametrize('wpo_mem', [None, '128G'])
+def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs, wpo_mem):
     # A copied checkout keeps generated result directories inside this test.
     folder = tmp_path / 'experiments' / 'mnist'
     folder.mkdir(parents=True)
@@ -32,9 +33,11 @@ print(1000 + len(path.read_text().splitlines()))
 ''')
     sbatch.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
-           if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS'}}
+           if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS', 'WPO_MEM'}}
     if hat_epochs is not None:
         env['HAT_EPOCHS'] = hat_epochs
+    if wpo_mem is not None:
+        env['WPO_MEM'] = wpo_mem
     env.update({'PATH': f'{bin_dir}:{os.environ["PATH"]}',
            'SBATCH_CALLS': str(calls_file),
            'GPU_PARTITION': 'test-gpu', 'CPU_PARTITION': 'test-cpu'})
@@ -51,8 +54,10 @@ print(1000 + len(path.read_text().splitlines()))
         assert not any(arg.startswith('--constraint') for arg in args)
     for args in [digital, oi]:
         assert '--gres=gpu:1' in args and '--partition=test-gpu' in args
+        assert '--mem=16G' in args
     assert '--partition=test-cpu' in wpo
     assert '--cpus-per-task=64' in wpo
+    assert f'--mem={wpo_mem or "64G"}' in wpo
     assert '--hint=nomultithread' in wpo
     assert digital[-1] == '14'
     assert oi[-1] == '5'

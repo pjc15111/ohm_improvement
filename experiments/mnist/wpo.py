@@ -161,7 +161,7 @@ def train_hat_epoch(model, loader, device, optimizer, log_interval) -> dict:
             batch=index, count=targets.numel(), seconds=perf_counter() - start,
         ))
         if (index - 1) % log_interval == 0:
-            report_metrics(f'HAT batch {index}/{len(loader)}', batches[-1].metrics)
+            report_metrics(f'HAT batch {index - 1}/{len(loader)}', batches[-1].metrics)
     return dict(loss=loss_sum / count, accuracy=correct / count, count=count, batches=batches)
 
 
