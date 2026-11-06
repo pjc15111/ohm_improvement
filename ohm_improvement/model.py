@@ -8,6 +8,11 @@ from typing import TypeAlias
 import torch
 from torch import nn
 from aihwkit.nn.modules.base import AnalogLayerBase
+from aihwkit.nn.modules.conv import AnalogConv1d, AnalogConv2d, AnalogConv3d
+from aihwkit.nn.modules.conv_mapped import (
+    AnalogConv1dMapped, AnalogConv2dMapped, AnalogConv3dMapped,
+)
+from aihwkit.simulator.tiles.array import TileModuleArray
 from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.simulator.tiles.inference import InferenceTile
 
@@ -27,6 +32,9 @@ class OIModel(nn.Module):
         super().__init__()
         if not isinstance(analog_model, AnalogLayerBase):
             raise TypeError("OIModel requires an AIHWKIT analog model or layer")
+        for layer in analog_model.modules():
+            if isinstance(layer, (AnalogConv1d, AnalogConv3d, AnalogConv1dMapped, AnalogConv3dMapped)):
+                raise NotImplementedError("OI supports unfolded Conv2d only; indexed convolutions are unsupported")
         if seed is None:
             seed = torch.randint(0, 2**63 - 1, ()).item()
         elif type(seed) is not int or not 0 <= seed < 2**63:
@@ -45,6 +53,8 @@ class OIModel(nn.Module):
                 converted[id(child)] = result
                 return result
             converted[id(child)] = child
+            if isinstance(child, (AnalogConv2d, AnalogConv2dMapped)):
+                child.use_indexed = False
             for name, grandchild in list(child._modules.items()):
                 if grandchild is not None:
                     child._modules[name] = convert(grandchild, f"{path}.{name}")
@@ -135,6 +145,12 @@ class OIModel(nn.Module):
                 groups["bias"]["params"].append(tile.bias)
             if include_output_scaling and tile.out_scaling_alpha is not None:
                 groups["output_scaling"]["params"].append(tile.out_scaling_alpha)
+
+        if include_bias:
+            # Mapped arrays own one digital bias after the partial tile sums.
+            for module in self._model.modules():
+                if isinstance(module, (TileModuleArray, AnalogConv2dMapped)) and module.bias is not None:
+                    groups["bias"]["params"].append(module.bias)
 
         result = []
         for name, group in groups.items():

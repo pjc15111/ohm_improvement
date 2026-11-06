@@ -34,6 +34,10 @@ class AnalogTileHolder:
 
 
 class OITile(nn.Module):
+    """Differentiable tile using ordinary matrix inputs, including unfolded Conv2d."""
+
+    supports_indexed = False
+
     def __init__(
         self,
         tile,
@@ -48,6 +52,9 @@ class OITile(nn.Module):
             raise TypeError("OITile only supports conversion of InferenceTile")
 
         self.train(tile.training)
+        # Conversion can follow an indexed forward. Both inference and our
+        # calibration probes must subsequently take the ordinary matrix path.
+        tile.get_analog_ctx().set_indexed(False)
 
         self.original_drift_compensation = deepcopy(
             tile.rpu_config.drift_compensation
@@ -87,6 +94,31 @@ class OITile(nn.Module):
     def get_analog_tile(self) -> InferenceTile:
         """Return the underlying AIHWKIT analog tile."""
         return self.analog_tile_holder.analog_tile
+
+    @property
+    def is_cuda(self) -> bool:
+        return self.get_analog_tile().is_cuda
+
+    @property
+    def device(self):
+        return self.get_analog_tile().device
+
+    @property
+    def in_size(self) -> int:
+        return self.get_analog_tile().in_size
+
+    @property
+    def out_size(self) -> int:
+        return self.get_analog_tile().out_size
+
+    def get_tensor_view(self, ndim: int, dim: Optional[int] = None) -> tuple:
+        return self.get_analog_tile().get_tensor_view(ndim, dim)
+
+    def is_indexed(self) -> bool:
+        return False
+
+    def set_indexed(self, *args, **kwargs) -> None:
+        raise NotImplementedError("OITile does not support indexing; use unfolded Conv2d")
 
     def init_conductances(
         self,
