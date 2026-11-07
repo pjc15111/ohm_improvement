@@ -36,7 +36,7 @@ print(1000 + len(path.read_text().splitlines()))
     sbatch.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
            if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS', 'WPO_MEM',
-                          'NOISE_MODE', 'OI_SINGLE_EPOCHS', 'GPU_TIME', 'WPO_TIME', 'SEED_BASE', 'WPO_WORKERS'}}
+                          'NOISE_MODE', 'OI_LONG_EPOCHS', 'GPU_TIME', 'WPO_TIME', 'SEED_BASE', 'WPO_WORKERS'}}
     if wpo_workers is not None:
         env['WPO_WORKERS'] = wpo_workers
     if seed_base is not None:
@@ -52,19 +52,22 @@ print(1000 + len(path.read_text().splitlines()))
            'GPU_PARTITION': 'test-gpu', 'CPU_PARTITION': 'test-cpu'})
     subprocess.run(['bash', str(folder / 'submit.sh')], env=env, check=True,
                    capture_output=True, text=True)
-    digital, hat, wpo, *ois, cleanup = [json.loads(line) for line in calls_file.read_text().splitlines()]
-    assert len(ois) == 6
-    bases = [args[args.index(str(folder / 'run.slurm')) + 3] for args in [digital, hat, wpo, *ois, cleanup]]
+    digital, hat, wpo_digital, oi_d10, oi_d20, wpo_hat, oi_h10, oi_h20, cleanup = [json.loads(line) for line in calls_file.read_text().splitlines()]
+    wpos = [wpo_digital, wpo_hat]
+    ois = [oi_d10, oi_d20, oi_h10, oi_h20]
+    assert len(ois) == 4
+    bases = [args[args.index(str(folder / 'run.slurm')) + 3] for args in [digital, hat, *wpos, *ois, cleanup]]
     assert len(set(bases)) == 1
     assert 0 <= int(bases[0]) < 2**32
     if seed_base is not None:
         assert bases[0] == seed_base
     assert '--dependency=afterok:1001' in hat
-    assert '--dependency=aftercorr:1002' in wpo
+    assert '--dependency=aftercorr:1001' in wpo_digital
+    assert '--dependency=aftercorr:1002' in wpo_hat
     assert all('--dependency=afterok:1002' in args for args in ois)
-    assert '--dependency=afterany:1001:1002:1003:1004:1005:1006:1007:1008:1009' in cleanup
+    assert '--dependency=afterany:1001:1002:1003:1004:1005:1006:1007:1008' in cleanup
     assert not any(arg.startswith('--dependency') for arg in digital)
-    for args in [digital, hat, wpo, *ois]:
+    for args in [digital, hat, *wpos, *ois]:
         assert '--array=1-5' in args
         assert '--kill-on-invalid-dep=yes' in args
         assert not any(arg.startswith('--constraint') for arg in args)
@@ -72,17 +75,17 @@ print(1000 + len(path.read_text().splitlines()))
     for args in [digital, hat, *ois]:
         assert '--gres=gpu:1' in args and '--partition=test-gpu' in args
         assert '--mem=16G' in args
-    assert '--partition=test-cpu' in wpo
-    assert f'--cpus-per-task={wpo_workers or "64"}' in wpo
-    assert f'--mem={wpo_mem or "64G"}' in wpo
-    assert '--hint=nomultithread' in wpo
-    assert digital[-1] == '14'
-    assert hat[-1] == ('5' if hat_epochs is None else hat_epochs)
-    assert [args[-4:] for args in ois] == [
-        [epochs, count, initialization, noise_mode or 'fresh']
-        for initialization in ['digital', 'hat']
-        for epochs, count in [('5', '12'), ('60', '1'), ('60', '1-lr0.1')]]
-    assert not any(arg.startswith('--gres') for arg in wpo)
+    assert all('--partition=test-cpu' in job for job in wpos)
+    assert all(f'--cpus-per-task={wpo_workers or "64"}' in job for job in wpos)
+    assert all(f'--mem={wpo_mem or "64G"}' in job for job in wpos)
+    assert all('--hint=nomultithread' in job for job in wpos)
+    assert digital[-1] == '10'
+    assert hat[-1] == ('10' if hat_epochs is None else hat_epochs)
+    assert [args[-3:] for args in ois] == [
+        [epochs, initialization, noise_mode or 'fresh']
+        for initialization in ['digital', 'hat'] for epochs in ['10', '20']]
+    assert [args[-1] for args in wpos] == ['digital', 'hat']
+    assert all(not any(arg.startswith('--gres') for arg in job) for job in wpos)
 
     run_dir = next((tmp_path / 'results' / 'mnist').glob('run-*'))
     checkpoint = run_dir / 'checkpoints' / 'seed-1.pt'
@@ -108,36 +111,36 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
     git.chmod(0o755)
     env = {**os.environ, 'SLURM_ARRAY_TASK_ID': '2', 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
            'WPO_WORKERS': '1'}
+    conditions = [('digital', ['10']), ('hat', ['10']),
+                  ('oi', ['10', 'hat', 'fresh']), ('oi', ['20', 'hat', 'fresh']),
+                  ('oi', ['10', 'digital', 'fresh']), ('oi', ['20', 'digital', 'fresh']),
+                  ('wpo', ['hat']), ('wpo', ['digital'])]
     commands = []
-    for phase, arguments in [('digital', ['14']), ('hat', ['5']),
-                              ('oi', ['5', '12', 'hat', 'fresh']),
-                              ('oi', ['60', '1', 'hat', 'fresh']),
-                              ('oi', ['60', '1-lr0.1', 'hat', 'fresh']),
-                              ('oi', ['60', '1-lr0.1', 'digital', 'fresh']), ('wpo', [])]:
+    for phase, arguments in conditions:
         completed = subprocess.run(['bash', str(MNIST / 'run.slurm'), phase,
                                     str(tmp_path / 'results'), '123456', *arguments],
                                    env=env, cwd=tmp_path, capture_output=True, text=True, check=True)
         commands.append(json.loads(completed.stdout.splitlines()[-1]))
-    for argv in commands:
+    shared_hat = commands[1][commands[1].index('--output-checkpoint') + 1]
+    for (phase, arguments), argv in zip(conditions, commands):
         assert argv[argv.index('--seed') + 1] == '123458'
         assert argv[argv.index('--checkpoint') + 1].endswith('/checkpoints/seed-2.pt')
-    shared_hat = commands[1][commands[1].index('--output-checkpoint') + 1]
-    for argv in commands[2:5] + [commands[-1]]:
-        assert argv[argv.index('--hat-checkpoint') + 1] == shared_hat
-        assert argv[argv.index('--noise-seed') + 1] == '102'
-    assert commands[-1][commands[-1].index('--workers') + 1] == '1'
-    for argv, epochs, realizations, sampling in zip(commands[2:4], ['5', '60'], ['4', '1'], ['all', 'random']):
-        assert argv[argv.index('--oi-epochs') + 1] == epochs
-        assert argv[argv.index('--train-realizations') + 1] == realizations
-        assert argv[argv.index('--time-sampling') + 1] == sampling
-        assert argv[argv.index('--evaluation-realizations') + 1] == '4'
-        assert argv[argv.index('--noise-mode') + 1] == 'fresh'
-    for argv, initialization in zip(commands[4:6], ['hat', 'digital']):
-        assert argv[argv.index('--oi-epochs') + 1] == '60'
-        assert argv[argv.index('--train-realizations') + 1] == '1'
-        assert argv[argv.index('--time-sampling') + 1] == 'random'
-        assert argv[argv.index('--conductance-lr') + 1] == '0.001'
-        assert argv[argv.index('--significance-lr') + 1] == '0.00001'
-        assert argv[argv.index('--results-file') + 1].endswith(f'/oi-{initialization}-s1-lr0.1.json')
-    assert '--hat-checkpoint' not in commands[5]
-    assert '--conductance-lr' not in commands[3]  # Keep the original s1 control.
+        if phase in ['oi', 'wpo']:
+            assert argv[argv.index('--noise-seed') + 1] == '102'
+            initialization = arguments[1] if phase == 'oi' else arguments[0]
+            if initialization == 'hat':
+                assert argv[argv.index('--hat-checkpoint') + 1] == shared_hat
+            else:
+                assert '--hat-checkpoint' not in argv
+        if phase == 'oi':
+            assert argv[argv.index('--oi-epochs') + 1] == arguments[0]
+            for flag, value in [('--train-realizations', '1'), ('--time-sampling', 'random'),
+                                ('--conductance-lr', '0.001'), ('--significance-lr', '0.00001'),
+                                ('--bias-lr', '0.00001'), ('--output-scaling-lr', '0.00001'),
+                                ('--evaluation-realizations', '4'), ('--noise-mode', 'fresh')]:
+                assert argv[argv.index(flag) + 1] == value
+            assert '--optimize-bias' in argv and '--optimize-output-scaling' in argv
+            assert argv[argv.index('--results-file') + 1].endswith(f'/oi-{arguments[1]}-e{arguments[0]}.json')
+        if phase == 'wpo':
+            assert argv[argv.index('--workers') + 1] == '1'
+            assert argv[argv.index('--results-file') + 1].endswith(f'/wpo-{arguments[0]}.json')

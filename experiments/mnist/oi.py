@@ -1,7 +1,7 @@
 """MNIST OI optimization and stock evaluation (adapted from PyTorch's example)."""
 
 import argparse
-from functools import partial
+from copy import deepcopy
 from torch.utils.data import DataLoader
 
 from experiments.history import ExperimentHistory, HistoryRecord
@@ -54,6 +54,8 @@ def parse_args(argv=None):
                         help='additional final-evaluation times, excluded from training')
     parser.add_argument('--pair-factors', type=float, nargs='+', default=[1.0])
     parser.add_argument('--optimize-significance', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--optimize-bias', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--optimize-output-scaling', action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
     if not 0 <= args.noise_seed < 2**63:
         parser.error('noise seed must be an integer in [0, 2**63)')
@@ -145,8 +147,8 @@ def optimize_oi_epoch(oi_model: oi.OIModel, loader, device, realization_ids, tim
 def optimize_oi(args, analog_model: oi.AnalogModel, train_loader, device):
     oi_model = oi.OIModel(analog_model, seed=args.noise_seed)
     parameters = oi_model.optimization_parameters(
-        include_conductances=True, include_output_scaling=False,
-        include_bias=False, include_significance=args.optimize_significance,
+        include_conductances=True, include_output_scaling=args.optimize_output_scaling,
+        include_bias=args.optimize_bias, include_significance=args.optimize_significance,
         conductance_lr=args.oi_lr, significance_lr=args.significance_lr,
         bias_lr=args.bias_lr, output_scaling_lr=args.output_scaling_lr,
     )
@@ -175,9 +177,12 @@ def optimize_oi(args, analog_model: oi.AnalogModel, train_loader, device):
 
 
 def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, device,
-                   realization_ids, times, seed, *, baseline_model=None, training_times=None):
+                   realization_ids, times, seed, *, baseline_model=None, training_times=None,
+                   seen_loader=None):
     """Evaluate ordinary and optimized mappings through the same stock simulator."""
-    evaluate = partial(evaluate_classifier, loader=loader, device=device)
+    loaders = {'seen': seen_loader, 'unseen': loader} if seen_loader is not None else {'unseen': loader}
+    def evaluate(model):
+        return {split: evaluate_classifier(model, data, device) for split, data in loaders.items()}
     # Snapshot both schemes before evaluation mutates the retained analog model.
     evaluators = {
         'baseline': evaluator_from_analog(analog_model if baseline_model is None else baseline_model, seed=seed),
@@ -190,10 +195,15 @@ def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, d
     results = []
     for method, evaluator in evaluators.items():
         for record in evaluate_programming(evaluator, evaluate, realization_ids, times):
-            if training_times is not None:
-                record['time_split'] = 'seen' if record['t_inference'] in training_times else 'unseen'
-            results.append(dict(method=method, **record))
-            report_metrics(f"{method} {record['realization_id']} t={record['t_inference']}s", record)
+            for split in loaders:
+                result = dict(method=method, data_split=split,
+                              **{key: value for key, value in record.items() if key not in loaders},
+                              **record[split])
+                if training_times is not None:
+                    result['time_split'] = 'seen' if record['t_inference'] in training_times else 'unseen'
+                results.append(result)
+                report_metrics(f"{method} data={split} {record['realization_id']} "
+                               f"t={record['t_inference']}s", result)
     return results
 
 
@@ -257,12 +267,13 @@ def main(argv=None):
                       if args.hat_checkpoint else None)
     oi_model, oi_history = optimize_oi(args, analog_model, train_loader, device)
     times = evaluation_times(args.times, args.unseen_times)
-    results = run_comparison(
-        analog_model, oi_model, test_loader, device,
-        [f'test{i + 1}' for i in range(args.evaluation_realizations)],
-        times, args.noise_seed, baseline_model=baseline_model, training_times=args.times,
-    )
     seen_loader = DataLoader(train_loader.dataset, batch_size=args.test_batch_size, shuffle=False)
+    results = run_comparison(
+        deepcopy(analog_model), oi_model, test_loader, device,
+        [f'test{i + 1}' for i in range(args.evaluation_realizations)],
+        times, args.noise_seed, baseline_model=deepcopy(baseline_model), training_times=args.times,
+        seen_loader=seen_loader,
+    )
     diagnostics = evaluate_generalization(
         oi_model, {'seen': seen_loader, 'unseen': test_loader},
         {'seen': seen_realizations(oi_history, args.evaluation_realizations),

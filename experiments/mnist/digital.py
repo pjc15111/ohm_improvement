@@ -8,6 +8,7 @@ from time import perf_counter
 
 import torch
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 from experiments.common import evaluate_classifier
 from experiments.history import ExperimentHistory, HistoryRecord
@@ -121,9 +122,13 @@ def main(argv=None):
     checkpoint = Path(config.checkpoint)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), checkpoint)
+    seen_loader = DataLoader(train_loader.dataset, batch_size=config.test_batch_size, shuffle=False)
     history = ExperimentHistory(
         method='digital', config=asdict(config), digital_history=digital_history,
         digital_baseline=digital_history[-1]['evaluation'],
+        results=[dict(method='digital', data_split='seen',
+                      **evaluate_classifier(model, seen_loader, device)),
+                 dict(method='digital', data_split='unseen', **digital_history[-1]['evaluation'])],
     )
     history.save(config.results_file)
     print(f'Checkpoint: {checkpoint}')

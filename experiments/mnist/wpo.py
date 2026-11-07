@@ -21,6 +21,7 @@ from time import perf_counter
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from aihwkit.inference.converter.conductance import CustomPairConductanceConverter
 from aihwkit.inference.converter.wpo import WeightProgrammingOptimizer, denormalize, stop_criterion
@@ -359,6 +360,7 @@ def evaluate_candidate(args, analog_model, loader, converter) -> list[dict]:
 def run_comparison(
     args: Namespace, analog_model: AnalogModel,
     converter: CustomPairConductanceConverter, loader, *, baseline_model: AnalogModel | None = None,
+    seen_loader=None,
 ) -> list[dict]:
     """Evaluate baseline/WPO mappings through the shared stock evaluator."""
     evaluators = {'baseline': evaluator_from_analog(
@@ -369,16 +371,23 @@ def run_comparison(
     evaluators['wpo'] = evaluator_from_analog(
         deepcopy(analog_model), converter=converter, seed=args.noise_seed,
     )
-    evaluate = partial(evaluate_classifier, loader=loader, device=torch.device('cpu'))
+    loaders = {'seen': seen_loader, 'unseen': loader} if seen_loader is not None else {'unseen': loader}
+    def evaluate(model):
+        return {split: evaluate_classifier(model, data, torch.device('cpu')) for split, data in loaders.items()}
     realization_ids = [f'test{i + 1}' for i in range(args.evaluation_realizations)]
     results = []
     for method, evaluator in evaluators.items():
         for record in evaluate_programming(
             evaluator, evaluate, realization_ids, evaluation_times(args.times, args.unseen_times),
         ):
-            record['time_split'] = 'seen' if record['t_inference'] in args.times else 'unseen'
-            results.append(dict(method=method, **record))
-            report_metrics(f"{method} {record['realization_id']} t={record['t_inference']}s", record)
+            for split in loaders:
+                result = dict(method=method, data_split=split,
+                              **{key: value for key, value in record.items() if key not in loaders},
+                              **record[split])
+                result['time_split'] = 'seen' if record['t_inference'] in args.times else 'unseen'
+                results.append(result)
+                report_metrics(f"{method} data={split} {record['realization_id']} "
+                               f"t={record['t_inference']}s", result)
     return results
 
 
@@ -422,7 +431,9 @@ def main(argv=None) -> ExperimentHistory:
         g_min=float(converter.g_min), g_max=float(converter.g_max),
     ))
     history.save(args.results_file)
-    history.results = run_comparison(args, prepared, converter, test_loader, baseline_model=baseline)
+    seen_loader = DataLoader(train_loader.dataset, batch_size=args.test_batch_size, shuffle=False)
+    history.results = run_comparison(args, prepared, converter, test_loader,
+                                     baseline_model=baseline, seen_loader=seen_loader)
     history.config['stage'] = 'complete'
     history.save(args.results_file)
     print(f'Results: {args.results_file}')

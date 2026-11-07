@@ -73,11 +73,12 @@ def test_mnist_synthetic_dry_run(monkeypatch, tmp_path):
     results = mnist.main(['--dry-run', '--no-accel', '--batch-size', '2', '--test-batch-size', '2',
                           '--checkpoint', str(checkpoint),
                           '--results-file', str(tmp_path / 'results.json')])
+    assert {r['data_split'] for r in digital.results} == {'seen', 'unseen'}
     assert results.method == 'oi'
     assert results.digital_history == []
     assert len(results.optimization_history) == 1
     assert results.digital_baseline == digital.digital_baseline
-    assert [r['method'] for r in results.results] == ['baseline', 'oi']
+    assert [r['method'] for r in results.results] == ['baseline', 'baseline', 'oi', 'oi']
     assert all(r['realization_id'] == 'test1' and r['count'] == 2
                and torch.isfinite(torch.tensor(r['loss'])) for r in results.results)
 

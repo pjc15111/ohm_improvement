@@ -28,7 +28,9 @@ export MKL_NUM_THREADS=$OMP_NUM_THREADS
 checkpoint=$run_dir/checkpoints/seed-$replicate.pt
 label=$phase
 if [[ $phase == oi ]]; then
-    label="oi-$3-s$2"
+    label="oi-$2-e$1"
+elif [[ $phase == wpo ]]; then
+    label="wpo-$1"
 fi
 results=$run_dir/seed-$replicate/$label.json
 hat_checkpoint=$run_dir/checkpoints/hat-seed-$replicate.pt
@@ -43,23 +45,22 @@ case "$phase" in
         "$python_bin" -m experiments.mnist.hat "${args[@]}" --hat-epochs "$1" --output-checkpoint "$hat_checkpoint"
         ;;
     oi)
-        if [[ $3 == hat ]]; then
+        if [[ $2 == hat ]]; then
             args+=(--hat-checkpoint "$hat_checkpoint")
         fi
-        case "$2" in
-            12) sampling=(--train-realizations 4 --time-sampling all) ;;
-            1|1-lr0.1) sampling=(--train-realizations 1 --time-sampling random) ;;
-            *) echo "Unsupported OI sample budget: $2" >&2; exit 1 ;;
-        esac
-        if [[ $2 == 1-lr0.1 ]]; then
-            args+=(--conductance-lr 0.001 --significance-lr 0.00001)
-        fi
         "$python_bin" -m experiments.mnist.oi "${args[@]}" --noise-seed "$((100 + replicate))" \
-            --oi-epochs "$1" "${sampling[@]}" --evaluation-realizations 4 --noise-mode "$4"
+            --oi-epochs "$1" --train-realizations 1 --time-sampling random \
+            --conductance-lr 0.001 --significance-lr 0.00001 \
+            --bias-lr 0.00001 --output-scaling-lr 0.00001 \
+            --optimize-bias --optimize-output-scaling \
+            --evaluation-realizations 4 --noise-mode "$3"
         ;;
     wpo)
+        if [[ $1 == hat ]]; then
+            args+=(--hat-checkpoint "$hat_checkpoint")
+        fi
         "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + replicate))" \
-            --no-accel --hat-checkpoint "$hat_checkpoint" --workers "${WPO_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
+            --no-accel --workers "${WPO_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
         ;;
     *)
         echo "Unknown MNIST phase: $phase" >&2

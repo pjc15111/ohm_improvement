@@ -178,8 +178,40 @@ def test_wpo_evaluates_held_out_times_without_adding_them_to_training():
     config.forward.is_perfect = True
     model = convert_to_analog(nn.Sequential(nn.Linear(3, 2), nn.LogSoftmax(-1)), config).eval()
     loader = DataLoader(TensorDataset(torch.ones(2, 3), torch.tensor([0, 1])), batch_size=2)
-    results = wpo.run_comparison(args, model, config.noise_model.g_converter, loader)
+    results = wpo.run_comparison(args, model, config.noise_model.g_converter, loader, seen_loader=loader)
+    for method in ['baseline', 'wpo']:
+        for time in [0., 3600.]:
+            records = [r for r in results if r['method'] == method and r['t_inference'] == time]
+            assert {r['data_split'] for r in records} == {'seen', 'unseen'}
+            assert records[0]['loss'] == records[1]['loss']
+            assert records[0]['accuracy'] == records[1]['accuracy']
     assert args.times == [0.]
     assert {(r['method'], r['t_inference'], r['time_split']) for r in results} == {
         (method, time, split) for method in ['baseline', 'wpo']
         for time, split in [(0., 'seen'), (3600., 'unseen')]}
+
+
+@pytest.mark.parametrize('train_digital_parameters', [True, False])
+def test_oi_can_update_bias_and_output_scaling(train_digital_parameters):
+    torch.manual_seed(17)
+    config = common.make_rpu_config([1.])
+    config.forward.is_perfect = True
+    config.mapping.learn_out_scaling = True
+    config.mapping.out_scaling_columnwise = True
+    config.noise_model.prog_noise_scale = 0.
+    config.noise_model.read_noise_scale = 0.
+    config.noise_model.drift_scale = 0.
+    analog = convert_to_analog(nn.Sequential(nn.Linear(3, 2), nn.LogSoftmax(-1)), config)
+    tile = next(analog.analog_tiles())
+    bias = tile.bias.detach().clone()
+    scaling = tile.out_scaling_alpha.detach().clone()
+    args = oi.parse_args(['--oi-epochs', '1', '--train-realizations', '1', '--times', '0',
+                         '--bias-lr', '0.001', '--output-scaling-lr', '0.001',
+                         *([] if train_digital_parameters else
+                           ['--no-optimize-bias', '--no-optimize-output-scaling'])])
+    loader = DataLoader(TensorDataset(torch.tensor([[.2, -.4, .8], [.1, .3, -.2]]),
+                                     torch.tensor([0, 0])), batch_size=2)
+    optimized, _ = oi.optimize_oi(args, analog, loader, torch.device('cpu'))
+    optimized_tile = next(optimized.oi_tiles())
+    assert torch.equal(optimized_tile.bias, bias) is not train_digital_parameters
+    assert torch.equal(optimized_tile.out_scaling_alpha, scaling) is not train_digital_parameters

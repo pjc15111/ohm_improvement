@@ -4,10 +4,10 @@ set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runs=${RUNS:-5}
-epochs=${DIGITAL_EPOCHS:-14}
-oi_epochs=${OI_EPOCHS:-5}
-oi_single_epochs=${OI_SINGLE_EPOCHS:-60}
-hat_epochs=${HAT_EPOCHS:-5}
+epochs=${DIGITAL_EPOCHS:-10}
+oi_epochs=${OI_EPOCHS:-10}
+oi_long_epochs=${OI_LONG_EPOCHS:-20}
+hat_epochs=${HAT_EPOCHS:-10}
 gpu_partition=${GPU_PARTITION:-general-gpu}
 cpu_partition=${CPU_PARTITION:-general}
 gpu_time=${GPU_TIME:-02:00:00}
@@ -17,8 +17,8 @@ wpo_mem=${WPO_MEM:-64G}
 wpo_workers=${WPO_WORKERS:-64}
 seed_base=${SEED_BASE:-$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')}
 
-if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ || ! $oi_single_epochs =~ ^[1-9][0-9]*$ ]]; then
-    echo 'RUNS, DIGITAL_EPOCHS, OI_EPOCHS, and OI_SINGLE_EPOCHS must be positive integers' >&2
+if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ || ! $oi_long_epochs =~ ^[1-9][0-9]*$ ]]; then
+    echo 'RUNS, DIGITAL_EPOCHS, OI_EPOCHS, and OI_LONG_EPOCHS must be positive integers' >&2
     exit 1
 fi
 if [[ $noise_mode != fixed && $noise_mode != fresh ]]; then
@@ -67,26 +67,27 @@ hat=$(submit "${array[@]}" "${resources[@]}" \
     --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --mem=16G --time="$gpu_time" \
     --output="$run_dir/seed-%a/hat.log" "$runner" hat "$run_dir" "$seed_base" "$hat_epochs")
 
-# CPU WPO can start as soon as its own shared HAT checkpoint is ready.
-wpo=$(submit "${array[@]}" "${resources[@]}" \
-    --dependency="aftercorr:$hat" --job-name=mnist-wpo \
-    --partition="$cpu_partition" --cpus-per-task="$wpo_workers" --hint=nomultithread --mem="$wpo_mem" --time="$wpo_time" \
-    --output="$run_dir/seed-%a/wpo.log" "$runner" wpo "$run_dir" "$seed_base")
-
-printf 'Seed base: %s\nDigital: %s\nHAT: %s\nWPO: %s\n' "$seed_base" "$digital" "$hat" "$wpo"
-cleanup_dependencies="$digital:$hat:$wpo"
+printf 'Seed base: %s\nDigital: %s\nHAT: %s\n' "$seed_base" "$digital" "$hat"
+cleanup_dependencies="$digital:$hat"
 for initialization in digital hat; do
-    for samples in 12 1 1-lr0.1; do
-        training_epochs=$oi_epochs
-        if [[ $samples != 12 ]]; then
-            training_epochs=$oi_single_epochs
-        fi
-        label="oi-$initialization-s$samples"
+    dependency=$digital
+    if [[ $initialization == hat ]]; then
+        dependency=$hat
+    fi
+    label="wpo-$initialization"
+    job=$(submit "${array[@]}" "${resources[@]}" \
+        --dependency="aftercorr:$dependency" --job-name="mnist-$label" \
+        --partition="$cpu_partition" --cpus-per-task="$wpo_workers" --hint=nomultithread --mem="$wpo_mem" --time="$wpo_time" \
+        --output="$run_dir/seed-%a/$label.log" "$runner" wpo "$run_dir" "$seed_base" "$initialization")
+    cleanup_dependencies+=":$job"
+    printf '%s: %s\n' "$label" "$job"
+    for training_epochs in "$oi_epochs" "$oi_long_epochs"; do
+        label="oi-$initialization-e$training_epochs"
         job=$(submit "${array[@]}" "${resources[@]}" \
             --dependency="afterok:$hat" --job-name="mnist-$label" \
             --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --mem=16G --time="$gpu_time" \
             --output="$run_dir/seed-%a/$label.log" "$runner" oi "$run_dir" "$seed_base" \
-            "$training_epochs" "$samples" "$initialization" "$noise_mode")
+            "$training_epochs" "$initialization" "$noise_mode")
         cleanup_dependencies+=":$job"
         printf '%s: %s\n' "$label" "$job"
     done

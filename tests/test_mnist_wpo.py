@@ -152,7 +152,8 @@ def test_full_command_runs_stock_wpo_and_saves_results(monkeypatch, tmp_path, ha
     assert records[-1].metrics['evaluation_seconds'] >= 0
     assert history.config['wpo_converter']['f_lst'] == [1.]
     methods = ['baseline', 'hat', 'wpo'] if hat_epochs else ['baseline', 'wpo']
-    assert [r['method'] for r in history.results] == methods
+    assert [r['method'] for r in history.results] == [method for method in methods for _ in range(2)]
+    assert {r['data_split'] for r in history.results} == {'seen', 'unseen'}
     assert all(r['realization_id'] == 'test1' and r['count'] == 2 and
                np.isfinite(r['loss']) for r in history.results)
     assert json.loads(results.read_text()) == asdict(history)
@@ -291,5 +292,5 @@ def test_module_command_with_real_workers_and_offline_mnist(tmp_path):
     history = json.loads(results.read_text())
     assert history['config']['stage'] == 'complete'
     assert history['config']['workers'] == 2
-    assert [row['method'] for row in history['results']] == ['baseline', 'wpo']
+    assert [row['method'] for row in history['results']] == ['baseline', 'baseline', 'wpo', 'wpo']
     assert any(row['realization_id'] == 'validation1' for row in history['optimization_history'])
