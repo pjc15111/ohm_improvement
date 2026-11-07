@@ -42,7 +42,7 @@ def parse_args(argv=None):
     parser.add_argument('--bias-lr', type=float, default=0.0001)
     parser.add_argument('--output-scaling-lr', type=float, default=0.0001)
     parser.add_argument('--train-realizations', type=int, default=4)
-    parser.add_argument('--noise-mode', choices=['fixed', 'fresh'], default='fresh',
+    parser.add_argument('--noise-mode', choices=['fixed', 'fresh'], default='fixed',
                         help='reuse a fixed noise bank or draw fresh realizations each batch')
     parser.add_argument('--evaluation-realizations', type=int, default=4)
     parser.add_argument('--times', type=float, nargs='+', default=[86400, 30 * 86400, 365 * 86400])
@@ -207,11 +207,13 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     device = select_device(args.no_accel)
     print(f'Device: {torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"}', flush=True)
-    model = load_digital_model(args.checkpoint, device)
+    # Convert every initialization on CPU so paired CPU/GPU runs receive identical
+    # normalized tile weights before transferring them to their execution device.
+    model = load_digital_model(args.checkpoint, torch.device('cpu'))
     train_loader, test_loader = make_loaders(args, device)
-    digital_baseline = evaluate_classifier(model, test_loader, device)
+    digital_baseline = evaluate_classifier(model, test_loader, torch.device('cpu'))
     report_metrics('Digital baseline', digital_baseline)
-    initial = load_digital_model(args.hat_checkpoint, device) if args.hat_checkpoint else model
+    initial = load_digital_model(args.hat_checkpoint, torch.device('cpu')) if args.hat_checkpoint else model
     analog_model = convert_to_analog(initial, rpu_config=make_rpu_config(args.pair_factors)).to(device)
     baseline_model = (convert_to_analog(model, rpu_config=make_rpu_config(args.pair_factors)).to(device)
                       if args.hat_checkpoint else None)

@@ -86,7 +86,7 @@ def test_mnist_synthetic_dry_run(monkeypatch, tmp_path):
     sample = saved['optimization_history'][0]['samples'][0]
     assert set(sample['metrics']) == {'loss', 'accuracy'}
     assert sample['step'] == 1 and sample['epoch'] == 1
-    assert sample['seconds'] >= 0 and sample['realization_id'] == 'train1:step1'
+    assert sample['seconds'] >= 0 and sample['realization_id'] == 'train1'
     assert sample['t_inference'] == saved['config']['times'][0]
     assert {(r['data_split'], r['realization_split']) for r in saved['diagnostics']} == {
         ('seen', 'seen'), ('seen', 'unseen'), ('unseen', 'seen'), ('unseen', 'unseen')}
@@ -101,7 +101,7 @@ def test_mnist_synthetic_dry_run(monkeypatch, tmp_path):
 def test_history_steps_continue_across_epochs_and_retain_all_samples(monkeypatch):
     from aihwkit.nn.conversion import convert_to_analog
     monkeypatch.setattr(mnist_digital, 'Net', lambda: nn.Sequential(nn.Linear(3, 2), nn.LogSoftmax(dim=1)))
-    args = mnist.parse_args(['--oi-epochs', '2', '--train-realizations', '2',
+    args = mnist.parse_args(['--oi-epochs', '2', '--train-realizations', '2', '--noise-mode', 'fresh',
                              '--times', '0', '86400'])
     loader = DataLoader(TensorDataset(torch.tensor([[.2, -.4, .8], [.1, .3, -.2], [.4, .2, .1]]),
                                      torch.tensor([0, 1, 0])), batch_size=2)

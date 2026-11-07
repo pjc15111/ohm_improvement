@@ -64,7 +64,7 @@ def test_noise_schedule_and_seen_realization_selection(noise_mode):
     assert set(oi.seen_realizations(history, 16)) == set(ids)
 
 
-def test_shared_hat_checkpoint_initializes_both_oi_conditions_and_wpo(monkeypatch, tmp_path):
+def test_shared_hat_checkpoint_initializes_both_oi_conditions_and_wpo(monkeypatch, tmp_path, device):
     def fake_mnist(root, train, download, transform):
         generator = torch.Generator().manual_seed(12 if train else 13)
         return TensorDataset(torch.randn(4, 1, 28, 28, generator=generator), torch.tensor([0, 1, 2, 3]))
@@ -79,12 +79,31 @@ def test_shared_hat_checkpoint_initializes_both_oi_conditions_and_wpo(monkeypatc
     assert hat_result.method == 'hat' and len(hat_result.optimization_history) == 1
     checkpoint_bytes = hat_path.read_bytes()
     assert json.loads((tmp_path / 'hat.json').read_text()) == asdict(hat_result)
+    initial_weights = []
+    original_oi, original_wpo = oi.optimize_oi, wpo.optimize_wpo
+    def capture_weights(model):
+        values = []
+        for tile in model.analog_tiles():
+            weights, bias = tile.get_weights(apply_weight_scaling=False)
+            values.extend(tensor.detach().cpu().clone() for tensor in
+                          [weights, bias, tile.get_mapping_scales(), tile.out_scaling_alpha]
+                          if tensor is not None)
+        initial_weights.append(values)
+    def capture_oi(args, model, *positional, **keywords):
+        capture_weights(model)
+        return original_oi(args, model, *positional, **keywords)
+    def capture_wpo(args, model, *positional, **keywords):
+        capture_weights(model)
+        return original_wpo(args, model, *positional, **keywords)
+    monkeypatch.setattr(oi, 'optimize_oi', capture_oi)
+    monkeypatch.setattr(wpo, 'optimize_wpo', capture_wpo)
     for count in [4, 16]:
         result = oi.main([
             '--checkpoint', str(digital_path), '--hat-checkpoint', str(hat_path),
             '--results-file', str(tmp_path / f'oi-{count}.json'), '--oi-epochs', '1',
             '--train-realizations', str(count), '--evaluation-realizations', '1', '--times', '0',
-            '--batch-size', '4', '--test-batch-size', '3', '--no-accel',
+            '--batch-size', '4', '--test-batch-size', '3',
+            *(['--no-accel'] if device.type == 'cpu' else []),
         ])
         assert result.config['hat_checkpoint'] == str(hat_path)
         assert result.optimization_history[0]['count'] == 4 * count
@@ -99,3 +118,8 @@ def test_shared_hat_checkpoint_initializes_both_oi_conditions_and_wpo(monkeypatc
     assert not any(isinstance(r, dict) and r.get('phase') == 'hat' for r in wpo_result.optimization_history)
     assert {r['method'] for r in wpo_result.results} == {'baseline', 'hat', 'wpo'}
     assert hat_path.read_bytes() == checkpoint_bytes
+    assert len(initial_weights) == 3
+    for weights in initial_weights[1:]:
+        assert len(weights) == len(initial_weights[0])
+        for actual, expected in zip(weights, initial_weights[0]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

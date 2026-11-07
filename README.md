@@ -119,20 +119,25 @@ bash experiments/mnist/submit.sh
 
 The wrapper uses five seeds, 14 digital epochs, and five HAT/OI epochs. It runs
 four OI conditions per seed: digital initialization with 4 or 16 realizations,
-and HAT initialization with 4 or 16 realizations. Each condition uses that many
-fresh noise realizations per minibatch by default. Digital baseline training
-remains noise-free; "fresh noise" here refers to OI's programming/drift/read
-samples, not input noise in the digital network. The network architecture is
-unchanged for this ablation.
+and HAT initialization with 4 or 16 realizations. Each condition optimizes a
+fixed noise bank by default. Each submission draws a fresh digital RNG seed base;
+replicate N uses `seed_base + N` for initialization and training-data order.
+Actual seeds appear in logs and history configuration. Directories `seed-N`
+identify replicate indices, not the sampled seed values. `SEED_BASE` can be set
+explicitly to reproduce a submission. Digital training remains noise-free, and
+the network architecture is unchanged for this ablation.
 
 HAT runs once per seed on GPU and saves a shared checkpoint. Both HAT+OI
-conditions and CPU WPO load those exact weights. All digital jobs finish before
+conditions and CPU WPO load those exact weights. Conversion to analog tiles is
+performed on CPU before transferring OI to GPU, preserving identical initial
+tile weights, digital biases, and scales within each replicate. OI noise seeds
+remain paired across conditions (`100 + replicate index`). All digital jobs finish before
 HAT starts; all HAT jobs finish before any OI job starts. Each CPU WPO task can
 start as soon as its own HAT checkpoint is ready. No GPU type or concurrency
 limit is imposed. The scripts use the repository's `venv` and current checkout.
 
 Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS`, `HAT_EPOCHS` (default five),
-`NOISE_MODE` (`fresh` or `fixed`), `GPU_PARTITION` (default `general-gpu`),
+`SEED_BASE` (random by default), `NOISE_MODE` (`fixed` by default, or `fresh`), `GPU_PARTITION` (default `general-gpu`),
 `CPU_PARTITION` (default `general`), `GPU_TIME`, or `WPO_TIME` before submission.
 Both compute time limits default to **02:00:00**. `MNIST_DATA` can select an
 existing shared dataset directory; otherwise the scripts use `data`.
@@ -169,7 +174,7 @@ This is necessary because stock evaluation and OI use different seed derivations
 passing the name `train1` to the stock evaluator would not reproduce OI's
 training noise. Backend forward/calibration randomness remains uncontrolled.
 
-For standalone ablations, use `--noise-mode fresh` (default) or `fixed`,
+For standalone ablations, use `--noise-mode fixed` (default) or `fresh`,
 `--train-realizations`, and `--evaluation-realizations`. Fresh IDs include the
 optimizer step, making them reproducible without retaining noise tensors. To
 prepare shared HAT weights directly:

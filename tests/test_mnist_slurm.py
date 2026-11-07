@@ -13,8 +13,9 @@ MNIST = Path(__file__).resolve().parents[1] / 'experiments' / 'mnist'
 
 @pytest.mark.parametrize('hat_epochs', [None, '0', '2'])
 @pytest.mark.parametrize('wpo_mem', [None, '128G'])
-@pytest.mark.parametrize('noise_mode', [None, 'fixed'])
-def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs, wpo_mem, noise_mode):
+@pytest.mark.parametrize('noise_mode', [None, 'fresh'])
+@pytest.mark.parametrize('seed_base', [None, '123456'])
+def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs, wpo_mem, noise_mode, seed_base):
     # A copied checkout keeps generated result directories inside this test.
     folder = tmp_path / 'experiments' / 'mnist'
     folder.mkdir(parents=True)
@@ -35,7 +36,9 @@ print(1000 + len(path.read_text().splitlines()))
     sbatch.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
            if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS', 'WPO_MEM',
-                          'NOISE_MODE', 'GPU_TIME', 'WPO_TIME'}}
+                          'NOISE_MODE', 'GPU_TIME', 'WPO_TIME', 'SEED_BASE'}}
+    if seed_base is not None:
+        env['SEED_BASE'] = seed_base
     if hat_epochs is not None:
         env['HAT_EPOCHS'] = hat_epochs
     if wpo_mem is not None:
@@ -49,6 +52,11 @@ print(1000 + len(path.read_text().splitlines()))
                    capture_output=True, text=True)
     digital, hat, wpo, *ois, cleanup = [json.loads(line) for line in calls_file.read_text().splitlines()]
     assert len(ois) == 4
+    bases = [args[args.index(str(folder / 'run.slurm')) + 3] for args in [digital, hat, wpo, *ois, cleanup]]
+    assert len(set(bases)) == 1
+    assert 0 <= int(bases[0]) < 2**32
+    if seed_base is not None:
+        assert bases[0] == seed_base
     assert '--dependency=afterok:1001' in hat
     assert '--dependency=aftercorr:1002' in wpo
     assert all('--dependency=afterok:1002' in args for args in ois)
@@ -69,7 +77,7 @@ print(1000 + len(path.read_text().splitlines()))
     assert digital[-1] == '14'
     assert hat[-1] == ('5' if hat_epochs is None else hat_epochs)
     assert [args[-4:] for args in ois] == [
-        ['5', count, initialization, noise_mode or 'fresh']
+        ['5', count, initialization, noise_mode or 'fixed']
         for initialization in ['digital', 'hat'] for count in ['4', '16']]
     assert not any(arg.startswith('--gres') for arg in wpo)
 
@@ -79,7 +87,35 @@ print(1000 + len(path.read_text().splitlines()))
     (run_dir / 'checkpoints' / 'hat-seed-1.pt').touch()
     history = run_dir / 'seed-1' / 'digital.json'
     history.write_text('{}\n')
-    subprocess.run(['bash', str(MNIST / 'run.slurm'), 'cleanup', str(run_dir)],
+    subprocess.run(['bash', str(MNIST / 'run.slurm'), 'cleanup', str(run_dir), bases[0]],
                    cwd=MNIST.parents[1], check=True, capture_output=True, text=True)
     assert not (run_dir / 'checkpoints').exists()
     assert history.read_text() == '{}\n'
+
+
+def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path):
+    python_bin = tmp_path / 'venv' / 'bin' / 'python'
+    python_bin.parent.mkdir(parents=True)
+    python_bin.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+    python_bin.chmod(0o755)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    git = bin_dir / 'git'
+    git.write_text('#!/bin/sh\nprintf "test-commit\\n"\n')
+    git.chmod(0o755)
+    env = {**os.environ, 'SLURM_ARRAY_TASK_ID': '2', 'PATH': f'{bin_dir}:{os.environ["PATH"]}'}
+    commands = []
+    for phase, arguments in [('digital', ['14']), ('hat', ['5']),
+                              ('oi', ['5', '4', 'hat', 'fixed']),
+                              ('oi', ['5', '16', 'hat', 'fixed']), ('wpo', [])]:
+        completed = subprocess.run(['bash', str(MNIST / 'run.slurm'), phase,
+                                    str(tmp_path / 'results'), '123456', *arguments],
+                                   env=env, cwd=tmp_path, capture_output=True, text=True, check=True)
+        commands.append(json.loads(completed.stdout.splitlines()[-1]))
+    for argv in commands:
+        assert argv[argv.index('--seed') + 1] == '123458'
+        assert argv[argv.index('--checkpoint') + 1].endswith('/checkpoints/seed-2.pt')
+    shared_hat = commands[1][commands[1].index('--output-checkpoint') + 1]
+    for argv in commands[2:]:
+        assert argv[argv.index('--hat-checkpoint') + 1] == shared_hat
+        assert argv[argv.index('--noise-seed') + 1] == '102'
