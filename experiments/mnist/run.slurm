@@ -48,9 +48,12 @@ case "$phase" in
         fi
         case "$2" in
             12) sampling=(--train-realizations 4 --time-sampling all) ;;
-            1) sampling=(--train-realizations 1 --time-sampling random) ;;
+            1|1-lr0.1) sampling=(--train-realizations 1 --time-sampling random) ;;
             *) echo "Unsupported OI sample budget: $2" >&2; exit 1 ;;
         esac
+        if [[ $2 == 1-lr0.1 ]]; then
+            args+=(--conductance-lr 0.001 --significance-lr 0.00001)
+        fi
         "$python_bin" -m experiments.mnist.oi "${args[@]}" --noise-seed "$((100 + replicate))" \
             --oi-epochs "$1" "${sampling[@]}" --evaluation-realizations 4 --noise-mode "$4"
         ;;

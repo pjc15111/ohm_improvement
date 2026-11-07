@@ -76,9 +76,9 @@ wpo=$(submit "${array[@]}" "${resources[@]}" \
 printf 'Seed base: %s\nDigital: %s\nHAT: %s\nWPO: %s\n' "$seed_base" "$digital" "$hat" "$wpo"
 cleanup_dependencies="$digital:$hat:$wpo"
 for initialization in digital hat; do
-    for samples in 12 1; do
+    for samples in 12 1 1-lr0.1; do
         training_epochs=$oi_epochs
-        if [[ $samples == 1 ]]; then
+        if [[ $samples != 12 ]]; then
             training_epochs=$oi_single_epochs
         fi
         label="oi-$initialization-s$samples"

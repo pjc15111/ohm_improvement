@@ -118,14 +118,16 @@ bash experiments/mnist/submit.sh
 ```
 
 The wrapper uses five seeds, 14 digital epochs, and five HAT epochs. It runs
-four OI conditions per seed, with either digital or shared HAT initialization:
+six OI conditions per seed, with either digital or shared HAT initialization:
 
 - 12 programming/time samples per optimizer update for 5 epochs: four independent
   realizations at each of the three training times.
 - One programming/time sample per update for 60 epochs: choose a training time
   uniformly at random on each update.
+- The same single-sample, 60-epoch run with learning rates reduced tenfold:
+  conductance LR `0.001`, significance LR `0.00001`.
 
-Both conditions draw fresh noise by default and have the same total number of
+All three conditions draw fresh noise by default and have the same total number of
 sample evaluations. Each sample follows program → drift → infer → backward;
 losses are averaged before one optimizer update. Programming realizations are
 independent across times as well as samples and updates. Each submission draws a fresh digital RNG seed base;
@@ -135,7 +137,7 @@ identify replicate indices, not the sampled seed values. `SEED_BASE` can be set
 explicitly to reproduce a submission. Digital training remains noise-free, and
 the network architecture is unchanged for this ablation.
 
-HAT runs once per seed on GPU and saves a shared checkpoint. Both HAT+OI
+HAT runs once per seed on GPU and saves a shared checkpoint. All three HAT+OI
 conditions and CPU WPO load those exact weights. Conversion to analog tiles is
 performed on CPU before transferring OI to GPU, preserving identical initial
 tile weights, digital biases, and scales within each replicate. OI noise seeds
@@ -163,8 +165,10 @@ Each `seed-N` directory contains these log/history pairs:
 - `wpo.log` / `wpo.json`
 - `oi-digital-s12.log` / `oi-digital-s12.json`
 - `oi-digital-s1.log` / `oi-digital-s1.json`
+- `oi-digital-s1-lr0.1.log` / `oi-digital-s1-lr0.1.json`
 - `oi-hat-s12.log` / `oi-hat-s12.json`
 - `oi-hat-s1.log` / `oi-hat-s1.json`
+- `oi-hat-s1-lr0.1.log` / `oi-hat-s1-lr0.1.json`
 
 Digital and HAT checkpoints are temporary handoffs. A final cleanup job removes
 them after every stage terminates, leaving only logs and histories.

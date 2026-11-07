@@ -53,7 +53,7 @@ print(1000 + len(path.read_text().splitlines()))
     subprocess.run(['bash', str(folder / 'submit.sh')], env=env, check=True,
                    capture_output=True, text=True)
     digital, hat, wpo, *ois, cleanup = [json.loads(line) for line in calls_file.read_text().splitlines()]
-    assert len(ois) == 4
+    assert len(ois) == 6
     bases = [args[args.index(str(folder / 'run.slurm')) + 3] for args in [digital, hat, wpo, *ois, cleanup]]
     assert len(set(bases)) == 1
     assert 0 <= int(bases[0]) < 2**32
@@ -62,7 +62,7 @@ print(1000 + len(path.read_text().splitlines()))
     assert '--dependency=afterok:1001' in hat
     assert '--dependency=aftercorr:1002' in wpo
     assert all('--dependency=afterok:1002' in args for args in ois)
-    assert '--dependency=afterany:1001:1002:1003:1004:1005:1006:1007' in cleanup
+    assert '--dependency=afterany:1001:1002:1003:1004:1005:1006:1007:1008:1009' in cleanup
     assert not any(arg.startswith('--dependency') for arg in digital)
     for args in [digital, hat, wpo, *ois]:
         assert '--array=1-5' in args
@@ -80,7 +80,8 @@ print(1000 + len(path.read_text().splitlines()))
     assert hat[-1] == ('5' if hat_epochs is None else hat_epochs)
     assert [args[-4:] for args in ois] == [
         [epochs, count, initialization, noise_mode or 'fresh']
-        for initialization in ['digital', 'hat'] for epochs, count in [('5', '12'), ('60', '1')]]
+        for initialization in ['digital', 'hat']
+        for epochs, count in [('5', '12'), ('60', '1'), ('60', '1-lr0.1')]]
     assert not any(arg.startswith('--gres') for arg in wpo)
 
     run_dir = next((tmp_path / 'results' / 'mnist').glob('run-*'))
@@ -110,7 +111,9 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
     commands = []
     for phase, arguments in [('digital', ['14']), ('hat', ['5']),
                               ('oi', ['5', '12', 'hat', 'fresh']),
-                              ('oi', ['60', '1', 'hat', 'fresh']), ('wpo', [])]:
+                              ('oi', ['60', '1', 'hat', 'fresh']),
+                              ('oi', ['60', '1-lr0.1', 'hat', 'fresh']),
+                              ('oi', ['60', '1-lr0.1', 'digital', 'fresh']), ('wpo', [])]:
         completed = subprocess.run(['bash', str(MNIST / 'run.slurm'), phase,
                                     str(tmp_path / 'results'), '123456', *arguments],
                                    env=env, cwd=tmp_path, capture_output=True, text=True, check=True)
@@ -119,7 +122,7 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
         assert argv[argv.index('--seed') + 1] == '123458'
         assert argv[argv.index('--checkpoint') + 1].endswith('/checkpoints/seed-2.pt')
     shared_hat = commands[1][commands[1].index('--output-checkpoint') + 1]
-    for argv in commands[2:]:
+    for argv in commands[2:5] + [commands[-1]]:
         assert argv[argv.index('--hat-checkpoint') + 1] == shared_hat
         assert argv[argv.index('--noise-seed') + 1] == '102'
     assert commands[-1][commands[-1].index('--workers') + 1] == '1'
@@ -129,3 +132,12 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
         assert argv[argv.index('--time-sampling') + 1] == sampling
         assert argv[argv.index('--evaluation-realizations') + 1] == '4'
         assert argv[argv.index('--noise-mode') + 1] == 'fresh'
+    for argv, initialization in zip(commands[4:6], ['hat', 'digital']):
+        assert argv[argv.index('--oi-epochs') + 1] == '60'
+        assert argv[argv.index('--train-realizations') + 1] == '1'
+        assert argv[argv.index('--time-sampling') + 1] == 'random'
+        assert argv[argv.index('--conductance-lr') + 1] == '0.001'
+        assert argv[argv.index('--significance-lr') + 1] == '0.00001'
+        assert argv[argv.index('--results-file') + 1].endswith(f'/oi-{initialization}-s1-lr0.1.json')
+    assert '--hat-checkpoint' not in commands[5]
+    assert '--conductance-lr' not in commands[3]  # Keep the original s1 control.
