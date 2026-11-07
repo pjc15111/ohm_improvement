@@ -12,10 +12,10 @@ MNIST = Path(__file__).resolve().parents[1] / 'experiments' / 'mnist'
 
 
 @pytest.mark.parametrize('hat_epochs', [None, '0', '2'])
-@pytest.mark.parametrize('wpo_mem', [None, '128G'])
+@pytest.mark.parametrize('wpo_mem,wpo_workers', [(None, None), ('8G', '1')])
 @pytest.mark.parametrize('noise_mode', [None, 'fresh'])
 @pytest.mark.parametrize('seed_base', [None, '123456'])
-def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs, wpo_mem, noise_mode, seed_base):
+def test_submission_dependencies_resources_and_checkpoint_cleanup(tmp_path, hat_epochs, wpo_mem, wpo_workers, noise_mode, seed_base):
     # A copied checkout keeps generated result directories inside this test.
     folder = tmp_path / 'experiments' / 'mnist'
     folder.mkdir(parents=True)
@@ -36,7 +36,9 @@ print(1000 + len(path.read_text().splitlines()))
     sbatch.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
            if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS', 'WPO_MEM',
-                          'NOISE_MODE', 'GPU_TIME', 'WPO_TIME', 'SEED_BASE'}}
+                          'NOISE_MODE', 'GPU_TIME', 'WPO_TIME', 'SEED_BASE', 'WPO_WORKERS'}}
+    if wpo_workers is not None:
+        env['WPO_WORKERS'] = wpo_workers
     if seed_base is not None:
         env['SEED_BASE'] = seed_base
     if hat_epochs is not None:
@@ -71,7 +73,7 @@ print(1000 + len(path.read_text().splitlines()))
         assert '--gres=gpu:1' in args and '--partition=test-gpu' in args
         assert '--mem=16G' in args
     assert '--partition=test-cpu' in wpo
-    assert '--cpus-per-task=64' in wpo
+    assert f'--cpus-per-task={wpo_workers or "64"}' in wpo
     assert f'--mem={wpo_mem or "64G"}' in wpo
     assert '--hint=nomultithread' in wpo
     assert digital[-1] == '14'
@@ -103,7 +105,8 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
     git = bin_dir / 'git'
     git.write_text('#!/bin/sh\nprintf "test-commit\\n"\n')
     git.chmod(0o755)
-    env = {**os.environ, 'SLURM_ARRAY_TASK_ID': '2', 'PATH': f'{bin_dir}:{os.environ["PATH"]}'}
+    env = {**os.environ, 'SLURM_ARRAY_TASK_ID': '2', 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+           'WPO_WORKERS': '1'}
     commands = []
     for phase, arguments in [('digital', ['14']), ('hat', ['5']),
                               ('oi', ['5', '4', 'hat', 'fixed']),
@@ -119,3 +122,4 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
     for argv in commands[2:]:
         assert argv[argv.index('--hat-checkpoint') + 1] == shared_hat
         assert argv[argv.index('--noise-seed') + 1] == '102'
+    assert commands[-1][commands[-1].index('--workers') + 1] == '1'

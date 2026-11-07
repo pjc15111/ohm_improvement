@@ -13,6 +13,7 @@ gpu_time=${GPU_TIME:-02:00:00}
 wpo_time=${WPO_TIME:-02:00:00}
 noise_mode=${NOISE_MODE:-fixed}
 wpo_mem=${WPO_MEM:-64G}
+wpo_workers=${WPO_WORKERS:-64}
 seed_base=${SEED_BASE:-$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')}
 
 if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ ]]; then
@@ -25,6 +26,10 @@ if [[ $noise_mode != fixed && $noise_mode != fresh ]]; then
 fi
 if [[ ! $hat_epochs =~ ^[0-9]+$ ]]; then
     echo 'HAT_EPOCHS must be a nonnegative integer' >&2
+    exit 1
+fi
+if [[ ! $wpo_workers =~ ^[1-9][0-9]*$ ]]; then
+    echo 'WPO_WORKERS must be a positive integer' >&2
     exit 1
 fi
 if [[ ! $seed_base =~ ^(0|[1-9][0-9]*)$ || ${#seed_base} -gt 10 ]] || ((seed_base > 4294967295)); then
@@ -64,7 +69,7 @@ hat=$(submit "${array[@]}" "${resources[@]}" \
 # CPU WPO can start as soon as its own shared HAT checkpoint is ready.
 wpo=$(submit "${array[@]}" "${resources[@]}" \
     --dependency="aftercorr:$hat" --job-name=mnist-wpo \
-    --partition="$cpu_partition" --cpus-per-task=64 --hint=nomultithread --mem="$wpo_mem" --time="$wpo_time" \
+    --partition="$cpu_partition" --cpus-per-task="$wpo_workers" --hint=nomultithread --mem="$wpo_mem" --time="$wpo_time" \
     --output="$run_dir/seed-%a/wpo.log" "$runner" wpo "$run_dir" "$seed_base")
 
 printf 'Seed base: %s\nDigital: %s\nHAT: %s\nWPO: %s\n' "$seed_base" "$digital" "$hat" "$wpo"

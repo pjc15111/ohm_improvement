@@ -11,6 +11,7 @@ from argparse import Namespace
 from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from functools import partial
+import errno
 import math
 import multiprocessing
 import os
@@ -153,25 +154,49 @@ def single_threaded_wpo():
                 os.environ[name] = value
 
 
-def initialize_worker(noise_seed, counter):
+def initialize_worker():
     torch.set_num_threads(1)
-    with counter.get_lock():
-        index = counter.value
-        counter.value += 1
+
+
+def evaluate_worker_task(task):
+    """Assign fresh, independent CPU RNG draws without shared worker state."""
+    function, candidate, noise_seed, index = task
     seed = int(np.random.SeedSequence([noise_seed, index]).generate_state(1, dtype=np.uint64)[0]) % 2**63
     torch.random.default_generator.manual_seed(seed)
     np.random.seed(seed % 2**32)
     random.seed(seed)
+    return function(candidate)
+
+
+def make_worker_pool(workers):
+    if workers == 1:
+        return nullcontext(None)
+    try:
+        return multiprocessing.get_context('spawn').Pool(workers, initializer=initialize_worker)
+    except OSError as error:
+        if error.errno != errno.ENOSPC:
+            raise
+        raise RuntimeError(
+            'WPO could not allocate multiprocessing shared-memory/semaphore resources on this node. '
+            'Check /dev/shm space and inodes on the allocated compute node. '
+            'Use WPO_WORKERS=1 with submit.sh, or --workers 1 directly, to bypass multiprocessing.'
+        ) from error
 
 
 class WPOWorkerMap:
     """Spawned workers for SciPy, without pickling the pool into WPO's losses."""
 
-    def __init__(self, pool):
+    def __init__(self, pool, noise_seed):
         self.pool = pool
+        self.noise_seed = noise_seed
+        self.evaluations = 0
 
     def __call__(self, function, candidates):
-        return self.pool.map(function, candidates)
+        tasks = []
+        for candidate in candidates:
+            tasks.append((function, candidate, self.noise_seed, self.evaluations))
+            self.evaluations += 1
+        return self.pool.map(evaluate_worker_task, tasks)
 
     def __getstate__(self):
         return {}
@@ -280,12 +305,7 @@ def optimize_wpo(
     with preserve_rng(), single_threaded_wpo():
         np.random.seed(args.seed % 2**32)
         torch.random.default_generator.manual_seed(args.noise_seed)
-        context = multiprocessing.get_context('spawn')
-        pool_context = (context.Pool(
-            args.workers, initializer=initialize_worker,
-            initargs=(args.noise_seed, context.Value('i', 0)),
-        ) if args.workers > 1 else nullcontext(None))
-        with pool_context as pool:
+        with make_worker_pool(args.workers) as pool:
             optimizer = WeightProgrammingOptimizer(
                 weights, [None] * len(args.pair_factors) if args.optimize_significance else args.pair_factors,
                 config, args.times, deepcopy(config.noise_model.g_converter),
@@ -294,7 +314,7 @@ def optimize_wpo(
                 nbins=args.wpo_bins, maxiter=args.wpo_maxiter, popsize=args.wpo_popsize,
                 baseline_iterations=args.wpo_baseline_iterations, loss_margin=args.wpo_loss_margin,
                 polish=args.wpo_polish, seed=args.seed % 2**32,
-                workers=WPOWorkerMap(pool) if pool is not None else 1,
+                workers=WPOWorkerMap(pool, args.noise_seed) if pool is not None else 1,
             )
             callback = WPOHistoryCallback(
                 optimizer, evaluate_progress, args.evaluation_interval,

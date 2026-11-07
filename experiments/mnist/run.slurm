@@ -50,7 +50,8 @@ case "$phase" in
             --oi-epochs "$1" --train-realizations "$2" --evaluation-realizations "$2" --noise-mode "$4"
         ;;
     wpo)
-        "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + replicate))" --no-accel --hat-checkpoint "$hat_checkpoint"
+        "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + replicate))" \
+            --no-accel --hat-checkpoint "$hat_checkpoint" --workers "${WPO_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
         ;;
     *)
         echo "Unknown MNIST phase: $phase" >&2

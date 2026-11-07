@@ -1,6 +1,7 @@
 """MNIST HAT, stock WPO, progress reporting, and final evaluation."""
 
 from dataclasses import asdict
+import errno
 import json
 import os
 from pathlib import Path
@@ -224,6 +225,34 @@ def test_stock_wpo_with_spawned_workers_and_progress_history():
     for tile, initial in zip(analog.analog_tiles(), before):
         for value, expected in zip(tile.get_weights(), initial):
             torch.testing.assert_close(value, expected, atol=0, rtol=0)
+
+
+def test_pool_resource_exhaustion_reports_serial_workaround(monkeypatch):
+    def exhausted(*args, **kwargs):
+        raise OSError(errno.ENOSPC, 'No space left on device')
+    # No Value/Lock API is present: pool creation must not allocate a seed counter.
+    monkeypatch.setattr(wpo.multiprocessing, 'get_context', lambda _: SimpleNamespace(Pool=exhausted))
+    with pytest.raises(RuntimeError, match='WPO_WORKERS=1') as caught:
+        wpo.make_worker_pool(2)
+    assert caught.value.__cause__.errno == errno.ENOSPC
+    with wpo.make_worker_pool(1) as pool:
+        assert pool is None
+
+
+def test_parallel_noise_seeds_follow_evaluations_without_shared_counters():
+    class LocalMap:
+        def map(self, function, tasks):
+            return list(map(function, tasks))
+    def sample(candidate):
+        return candidate, torch.rand(1).item(), float(np.random.random()), random.random()
+    with wpo.preserve_rng():
+        first = wpo.WPOWorkerMap(LocalMap(), 101)
+        split = first(sample, [0, 1]) + first(sample, [2, 3])
+        second = wpo.WPOWorkerMap(LocalMap(), 101)
+        assert split == second(sample, [0, 1, 2, 3])
+        assert len({row[1:] for row in split}) == 4
+        assert split != wpo.WPOWorkerMap(LocalMap(), 102)(sample, [0, 1, 2, 3])
+        assert pickle.loads(pickle.dumps(first)).__dict__ == {}
 
 
 def test_weight_distribution_is_normalized_per_tile():

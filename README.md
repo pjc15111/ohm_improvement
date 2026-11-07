@@ -142,7 +142,7 @@ Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS`, `HAT_EPOCHS` (default five),
 Both compute time limits default to **02:00:00**. `MNIST_DATA` can select an
 existing shared dataset directory; otherwise the scripts use `data`.
 WPO requests 64 physical CPU cores and 64 GB per job, independently of the GPU
-jobs' 16 GB; override memory with `WPO_MEM`. Spawned workers each load
+jobs' 16 GB; override process/CPU count with `WPO_WORKERS` and memory with `WPO_MEM`. Spawned workers each load
 Python/AIHWKIT, so memory usage grows with worker count.
 
 The wrapper prints job IDs and a directory under `results/mnist/run-*`.
@@ -205,10 +205,20 @@ and `--no-wpo-polish` to change search cost. Pair factors are fixed by default;
 small one-generation search with polishing disabled.
 
 `--workers` defaults to `SLURM_CPUS_PER_TASK` (64 in the wrapper), otherwise one.
-Parallel workers are spawned with one compute thread each and independent
-PyTorch/NumPy seed streams. Search/distribution sampling uses `--seed`;
+Parallel workers are spawned with one compute thread each. Each objective
+evaluation receives an independent seed assigned in the parent process, without
+a shared-memory seed counter. This changes the noise streams from earlier runs.
+Search/distribution sampling uses `--seed`;
 PCM sampling/evaluation uses `--noise-seed`. Parallel scheduling and AIHWKIT's
 separate backend RNG still prevent guaranteed bitwise repeatability.
+
+Python's process pool still needs operating-system semaphore resources. If it
+fails with `No space left on device`, check `/dev/shm` free space and inodes on
+the allocated compute node. Raising the job's RAM request does not by itself
+increase that filesystem's capacity. `WPO_WORKERS=1 WPO_MEM=8G bash experiments/mnist/submit.sh`
+requests a single CPU worker and bypasses multiprocessing as a temporary
+workaround; parallel operation may require HPC support to resolve node resource
+exhaustion.
 
 The callback records stock objective/TNMSE each generation. It evaluates the
 first generation and then every `--evaluation-interval` optimization seconds
