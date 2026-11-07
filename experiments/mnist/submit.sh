@@ -6,18 +6,19 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runs=${RUNS:-5}
 epochs=${DIGITAL_EPOCHS:-14}
 oi_epochs=${OI_EPOCHS:-5}
+oi_single_epochs=${OI_SINGLE_EPOCHS:-60}
 hat_epochs=${HAT_EPOCHS:-5}
 gpu_partition=${GPU_PARTITION:-general-gpu}
 cpu_partition=${CPU_PARTITION:-general}
 gpu_time=${GPU_TIME:-02:00:00}
 wpo_time=${WPO_TIME:-02:00:00}
-noise_mode=${NOISE_MODE:-fixed}
+noise_mode=${NOISE_MODE:-fresh}
 wpo_mem=${WPO_MEM:-64G}
 wpo_workers=${WPO_WORKERS:-64}
 seed_base=${SEED_BASE:-$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')}
 
-if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ ]]; then
-    echo 'RUNS, DIGITAL_EPOCHS, and OI_EPOCHS must be positive integers' >&2
+if [[ ! $runs =~ ^[1-9][0-9]*$ || ! $epochs =~ ^[1-9][0-9]*$ || ! $oi_epochs =~ ^[1-9][0-9]*$ || ! $oi_single_epochs =~ ^[1-9][0-9]*$ ]]; then
+    echo 'RUNS, DIGITAL_EPOCHS, OI_EPOCHS, and OI_SINGLE_EPOCHS must be positive integers' >&2
     exit 1
 fi
 if [[ $noise_mode != fixed && $noise_mode != fresh ]]; then
@@ -75,13 +76,17 @@ wpo=$(submit "${array[@]}" "${resources[@]}" \
 printf 'Seed base: %s\nDigital: %s\nHAT: %s\nWPO: %s\n' "$seed_base" "$digital" "$hat" "$wpo"
 cleanup_dependencies="$digital:$hat:$wpo"
 for initialization in digital hat; do
-    for realizations in 4 16; do
-        label="oi-$initialization-r$realizations"
+    for samples in 12 1; do
+        training_epochs=$oi_epochs
+        if [[ $samples == 1 ]]; then
+            training_epochs=$oi_single_epochs
+        fi
+        label="oi-$initialization-s$samples"
         job=$(submit "${array[@]}" "${resources[@]}" \
             --dependency="afterok:$hat" --job-name="mnist-$label" \
             --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --mem=16G --time="$gpu_time" \
             --output="$run_dir/seed-%a/$label.log" "$runner" oi "$run_dir" "$seed_base" \
-            "$oi_epochs" "$realizations" "$initialization" "$noise_mode")
+            "$training_epochs" "$samples" "$initialization" "$noise_mode")
         cleanup_dependencies+=":$job"
         printf '%s: %s\n' "$label" "$job"
     done

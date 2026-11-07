@@ -28,7 +28,7 @@ export MKL_NUM_THREADS=$OMP_NUM_THREADS
 checkpoint=$run_dir/checkpoints/seed-$replicate.pt
 label=$phase
 if [[ $phase == oi ]]; then
-    label="oi-$3-r$2"
+    label="oi-$3-s$2"
 fi
 results=$run_dir/seed-$replicate/$label.json
 hat_checkpoint=$run_dir/checkpoints/hat-seed-$replicate.pt
@@ -46,8 +46,13 @@ case "$phase" in
         if [[ $3 == hat ]]; then
             args+=(--hat-checkpoint "$hat_checkpoint")
         fi
+        case "$2" in
+            12) sampling=(--train-realizations 4 --time-sampling all) ;;
+            1) sampling=(--train-realizations 1 --time-sampling random) ;;
+            *) echo "Unsupported OI sample budget: $2" >&2; exit 1 ;;
+        esac
         "$python_bin" -m experiments.mnist.oi "${args[@]}" --noise-seed "$((100 + replicate))" \
-            --oi-epochs "$1" --train-realizations "$2" --evaluation-realizations "$2" --noise-mode "$4"
+            --oi-epochs "$1" "${sampling[@]}" --evaluation-realizations 4 --noise-mode "$4"
         ;;
     wpo)
         "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + replicate))" \

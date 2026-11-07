@@ -44,11 +44,13 @@ def test_oi_batch_updates_only_selected_parameters():
     significance = tile.significance.detach().clone()
     optimizer = torch.optim.Adam(model.optimization_parameters(include_output_scaling=False, include_bias=False, include_significance=False, conductance_lr=.01))
     metrics = mnist.optimize_oi_batch(model.eval(), torch.tensor([[.2, -.4, .8], [.1, .3, -.2]]),
-                                      torch.tensor([0, 1]), ["train1", "train2"], [0., 86400.], optimizer)
+                                      torch.tensor([0, 1]), mnist.training_samples(
+                                          ['train1', 'train2'], [0., 86400.], step=1,
+                                          noise_mode='fixed', time_sampling='all', generator=None), optimizer)
     assert metrics['count'] == 8
     assert len(metrics['samples']) == 4
     assert {(r.realization_id, r.time_index) for r in metrics['samples']} == {
-        ('train1', 0), ('train1', 1), ('train2', 0), ('train2', 1)}
+        ('train1/time0', 0), ('train1/time1', 1), ('train2/time0', 0), ('train2/time1', 1)}
     assert abs(sum(r.metrics['loss'] * r.count for r in metrics['samples']) - metrics['loss_sum']) < 1e-6
     assert any(not torch.equal(a, b) for a, b in zip(before, tile.g_plus))
     torch.testing.assert_close(tile.bias, bias)
@@ -86,7 +88,7 @@ def test_mnist_synthetic_dry_run(monkeypatch, tmp_path):
     sample = saved['optimization_history'][0]['samples'][0]
     assert set(sample['metrics']) == {'loss', 'accuracy'}
     assert sample['step'] == 1 and sample['epoch'] == 1
-    assert sample['seconds'] >= 0 and sample['realization_id'] == 'train1'
+    assert sample['seconds'] >= 0 and sample['realization_id'] == 'train1/time0/step1'
     assert sample['t_inference'] == saved['config']['times'][0]
     assert {(r['data_split'], r['realization_split']) for r in saved['diagnostics']} == {
         ('seen', 'seen'), ('seen', 'unseen'), ('unseen', 'seen'), ('unseen', 'unseen')}
@@ -119,7 +121,7 @@ def test_history_steps_continue_across_epochs_and_retain_all_samples(monkeypatch
     _, history = mnist.optimize_oi(args, analog, loader, device)
     samples = [sample for epoch in history for sample in epoch['samples']]
     assert len(samples) == 16
-    assert len({r.realization_id for r in samples}) == 8
+    assert len({r.realization_id for r in samples}) == 16
     assert all(is_dataclass(sample) for sample in samples)
     steps = []
     for step, records in groupby(samples, key=lambda sample: sample.step):

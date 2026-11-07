@@ -16,6 +16,15 @@ from aihwkit.simulator import rpu_base
 from aihwkit.simulator.configs import InferenceRPUConfig
 
 
+TRAINING_TIMES = [86400., 30 * 86400., 365 * 86400.]
+UNSEEN_TIMES = [7 * 86400., 90 * 86400., 3 * 365 * 86400.]
+
+
+def evaluation_times(training_times, unseen_times):
+    """Include training and held-out times once each, in chronological order."""
+    return sorted(set(training_times) | set(unseen_times))
+
+
 class Net(nn.Module):
     def __init__(self):
         super().__init__()

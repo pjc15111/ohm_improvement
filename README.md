@@ -117,10 +117,18 @@ To submit five paired seeds on SLURM:
 bash experiments/mnist/submit.sh
 ```
 
-The wrapper uses five seeds, 14 digital epochs, and five HAT/OI epochs. It runs
-four OI conditions per seed: digital initialization with 4 or 16 realizations,
-and HAT initialization with 4 or 16 realizations. Each condition optimizes a
-fixed noise bank by default. Each submission draws a fresh digital RNG seed base;
+The wrapper uses five seeds, 14 digital epochs, and five HAT epochs. It runs
+four OI conditions per seed, with either digital or shared HAT initialization:
+
+- 12 programming/time samples per optimizer update for 5 epochs: four independent
+  realizations at each of the three training times.
+- One programming/time sample per update for 60 epochs: choose a training time
+  uniformly at random on each update.
+
+Both conditions draw fresh noise by default and have the same total number of
+sample evaluations. Each sample follows program → drift → infer → backward;
+losses are averaged before one optimizer update. Programming realizations are
+independent across times as well as samples and updates. Each submission draws a fresh digital RNG seed base;
 replicate N uses `seed_base + N` for initialization and training-data order.
 Actual seeds appear in logs and history configuration. Directories `seed-N`
 identify replicate indices, not the sampled seed values. `SEED_BASE` can be set
@@ -136,8 +144,10 @@ HAT starts; all HAT jobs finish before any OI job starts. Each CPU WPO task can
 start as soon as its own HAT checkpoint is ready. No GPU type or concurrency
 limit is imposed. The scripts use the repository's `venv` and current checkout.
 
-Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS`, `HAT_EPOCHS` (default five),
-`SEED_BASE` (random by default), `NOISE_MODE` (`fixed` by default, or `fresh`), `GPU_PARTITION` (default `general-gpu`),
+Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS` (default five for 12 samples),
+`OI_SINGLE_EPOCHS` (default 60 for one sample), `HAT_EPOCHS` (default five),
+`SEED_BASE` (random by default), `NOISE_MODE` (`fresh` by default, or `fixed`),
+`GPU_PARTITION` (default `general-gpu`),
 `CPU_PARTITION` (default `general`), `GPU_TIME`, or `WPO_TIME` before submission.
 Both compute time limits default to **02:00:00**. `MNIST_DATA` can select an
 existing shared dataset directory; otherwise the scripts use `data`.
@@ -151,10 +161,10 @@ Each `seed-N` directory contains these log/history pairs:
 - `digital.log` / `digital.json`
 - `hat.log` / `hat.json`
 - `wpo.log` / `wpo.json`
-- `oi-digital-r4.log` / `oi-digital-r4.json`
-- `oi-digital-r16.log` / `oi-digital-r16.json`
-- `oi-hat-r4.log` / `oi-hat-r4.json`
-- `oi-hat-r16.log` / `oi-hat-r16.json`
+- `oi-digital-s12.log` / `oi-digital-s12.json`
+- `oi-digital-s1.log` / `oi-digital-s1.json`
+- `oi-hat-s12.log` / `oi-hat-s12.json`
+- `oi-hat-s1.log` / `oi-hat-s1.json`
 
 Digital and HAT checkpoints are temporary handoffs. A final cleanup job removes
 them after every stage terminates, leaving only logs and histories.
@@ -163,10 +173,19 @@ OI's `results` retain the ordinary stock-noise comparisons on the test dataset.
 The separate `diagnostics` field records the Cartesian product of
 `data_split = seen/unseen` and `realization_split = seen/unseen`, at each inference
 time. Seen data is the full MNIST training dataset; unseen data is the test
-split. Evaluation uses 4 realizations per group for the r4 condition and 16 for
-r16. Seen IDs are selected evenly throughout the unique realization IDs actually
-used during training; unseen IDs use a separate `testN` namespace. With fixed
-noise, evaluation covers the entire fixed training bank.
+split. All conditions evaluate four realizations per group. At training times,
+seen IDs are selected evenly from IDs actually trained at that specific time,
+so programming, drift, and read samples were all seen. At held-out times,
+previously trained programming realizations receive fresh time-dependent read
+noise. Unseen realizations use a separate `testN` namespace.
+
+Training times are 1 day, 30 days, and 1 year. Final evaluations additionally
+cover 7 days and 90 days (interpolation), and 3 years (extrapolation). Both ordinary
+results and diagnostics include `time_split = seen/unseen`. Held-out times do not
+enter OI training or the WPO objective/progress evaluations; they are evaluated
+only after optimization. Override these lists with `--times` and `--unseen-times`
+in the standalone OI/WPO programs. Passing `--unseen-times` with no values
+omits the additional times.
 
 Diagnostics generate exact OI realization states and export stock analog
 snapshots (`simulator = stock_snapshot`) for inference on both data splits.
@@ -174,9 +193,13 @@ This is necessary because stock evaluation and OI use different seed derivations
 passing the name `train1` to the stock evaluator would not reproduce OI's
 training noise. Backend forward/calibration randomness remains uncontrolled.
 
-For standalone ablations, use `--noise-mode fixed` (default) or `fresh`,
-`--train-realizations`, and `--evaluation-realizations`. Fresh IDs include the
-optimizer step, making them reproducible without retaining noise tensors. To
+For standalone ablations, use `--noise-mode fresh` (default) or `fixed`,
+`--train-realizations`, `--time-sampling all/random`, and
+`--evaluation-realizations`. In all-time mode, `--train-realizations` is the number
+of independent samples at each time; in random-time mode it is the number per
+optimizer update. Fresh IDs include the time index and global optimizer step,
+making them reproducible without retaining noise tensors. Time sampling has its
+own seeded RNG and continues across epoch boundaries. To
 prepare shared HAT weights directly:
 
 ```bash

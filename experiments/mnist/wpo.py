@@ -31,7 +31,7 @@ from experiments.history import ExperimentHistory, HistoryRecord
 from experiments.mnist.hat import train_hardware_aware
 from experiments.mnist.common import (
     load_digital_model, log_commit, make_loaders, make_rpu_config, report_metrics,
-    select_device,
+    select_device, TRAINING_TIMES, UNSEEN_TIMES, evaluation_times,
 )
 from ohm_improvement import AnalogModel
 
@@ -51,7 +51,9 @@ def parse_args(argv=None) -> Namespace:
     parser.add_argument('--dry-run', action='store_true', help='one batch and at most one HAT epoch')
     parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--pair-factors', type=float, nargs='+', default=[1.])
-    parser.add_argument('--times', type=float, nargs='+', default=[86400., 30 * 86400., 365 * 86400.])
+    parser.add_argument('--times', type=float, nargs='+', default=TRAINING_TIMES)
+    parser.add_argument('--unseen-times', type=float, nargs='*', default=UNSEEN_TIMES,
+                        help='additional final-evaluation times, excluded from WPO optimization')
     parser.add_argument('--evaluation-realizations', type=int, default=4)
     parser.add_argument('--hat-epochs', type=int, default=0, help='optional HAT epochs; zero skips HAT')
     parser.add_argument('--hat-lr', type=float, default=.01)
@@ -97,12 +99,13 @@ def parse_args(argv=None) -> Namespace:
            [*args.pair_factors, args.hat_lr, args.hat_gamma, args.hat_clip_sigma]):
         parser.error('pair factors, HAT learning rate, gamma, and clip sigma must be finite and positive')
     if any(not math.isfinite(value) or value < 0 for value in
-           [*args.times, args.hat_weight_noise, args.hat_momentum, args.evaluation_interval]):
+           [*args.times, *args.unseen_times, args.hat_weight_noise, args.hat_momentum, args.evaluation_interval]):
         parser.error('times, HAT noise/momentum, and evaluation interval must be finite and nonnegative')
     if args.dry_run:
         args.hat_epochs = min(args.hat_epochs, 1)
         args.evaluation_realizations = 1
         args.times = args.times[:1]
+        args.unseen_times = []
         args.progress_realizations = 1
         args.wpo_maxiter = 1
         args.wpo_popsize = 2
@@ -370,7 +373,10 @@ def run_comparison(
     realization_ids = [f'test{i + 1}' for i in range(args.evaluation_realizations)]
     results = []
     for method, evaluator in evaluators.items():
-        for record in evaluate_programming(evaluator, evaluate, realization_ids, args.times):
+        for record in evaluate_programming(
+            evaluator, evaluate, realization_ids, evaluation_times(args.times, args.unseen_times),
+        ):
+            record['time_split'] = 'seen' if record['t_inference'] in args.times else 'unseen'
             results.append(dict(method=method, **record))
             report_metrics(f"{method} {record['realization_id']} t={record['t_inference']}s", record)
     return results
