@@ -1,72 +1,69 @@
-from aihwkit.simulator.tiles.inference import (
-    InferenceTile
-)
-from aihwkit.inference.converter.base import BaseConductanceConverter
-from aihwkit.simulator.tiles.functions import AnalogFunction
+"""Differentiable programming and drift around a stock AIHWKIT inference tile."""
 
+from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
 import json
 import math
-
-import torch.nn as nn
+from typing import Optional, Tuple
 
 import torch
+from torch import Tensor, nn
+from aihwkit.inference.converter.base import BaseConductanceConverter
+from aihwkit.simulator.tiles.inference import InferenceTile
 
-from torch import Tensor
-from typing import Optional, Tuple
-from copy import deepcopy
-from dataclasses import dataclass
-
+from ._backend import AnalogTileHolder
 from .compensation import convert_compensation
 from .conductance import (
     convert_to_conductances,
     convert_back_to_weights,
+    _reconstruct_weights,
     ConductanceMapping
 )
 from .noise import convert_noise_model
 
 
 @dataclass
-class AnalogTileHolder:
-    """Hold the backend tile without registering it as a PyTorch submodule."""
+class _ProgrammedState:
+    realization_id: str
+    conductances: list[list[Tensor]]
+    coefficients: list[list[Tensor]]
+    tensor_versions: tuple[tuple[str, int, int], ...]
+    reference: Tensor | None = None
 
-    analog_tile: InferenceTile
+
+def _validate_seed(seed: int) -> None:
+    if type(seed) is not int or not 0 <= seed < 2**63:
+        raise ValueError("seed must be an integer in [0, 2**63)")
 
 
 class OITile(nn.Module):
-    """Differentiable tile using ordinary matrix inputs, including unfolded Conv2d."""
+    """Differentiable tile for matrix inputs, including unfolded Conv2d.
+
+    Move the stock tile to its target device and dtype before conversion.
+    Reprogram after loading a checkpoint, replacing parameters, or updating them.
+    Calibration is retained per programmed/drifted state, including its graph.
+    """
 
     supports_indexed = False
 
     def __init__(
         self,
-        tile,
+        tile: InferenceTile,
         g_converter: Optional[BaseConductanceConverter] = None,
-        train_significance = True,
+        train_significance: bool = True,
         *,
         seed: int,
     ):
-        nn.Module.__init__(self)
+        super().__init__()
 
-        if tile.__class__ not in {InferenceTile}:
-            raise TypeError("OITile only supports conversion of InferenceTile")
-
+        _validate_seed(seed)
+        noise_model, compensation, converter, mapping = self._prepare_conversion(tile, g_converter)
         self.train(tile.training)
-        # Conversion can follow an indexed forward. Both inference and our
-        # calibration probes must subsequently take the ordinary matrix path.
-        tile.get_analog_ctx().set_indexed(False)
-
-        self.original_drift_compensation = deepcopy(
-            tile.rpu_config.drift_compensation
-        )
-        self.compensation = convert_compensation(
-            self.original_drift_compensation
-        )
-        tile.rpu_config.drift_compensation = None
-
-        if not hasattr(tile.rpu_config, "noise_model"):
-            raise Exception("Seems that RPUConfig is not of type InferenceRPUConfig.")
-        self.noise_model = convert_noise_model(tile.rpu_config.noise_model)
+        self.original_drift_compensation = deepcopy(tile.rpu_config.drift_compensation)
+        self.compensation = compensation
+        self.noise_model = noise_model
+        self.g_converter = converter
 
         self.out_scaling_alpha = None
         if tile.out_scaling_alpha is not None:
@@ -83,13 +80,54 @@ class OITile(nn.Module):
             )
 
         self.analog_tile_holder = AnalogTileHolder(tile)
-        self.init_conductances(train_significance, g_converter)
-        # Model construction initializes/validates seeds; direct callers supply one.
-        self.register_buffer("noise_seed", torch.tensor(seed, dtype=torch.int64))
-        self._programmed = None
-        self._realization_id = None
-        self._parameter_versions = []
-        self._drifted = False
+        self._init_conductances(mapping, train_significance)
+        self.register_buffer("noise_seed", torch.tensor(seed, dtype=torch.int64, device=self.device))
+        self._probe = None
+        self._reset_programmed_state()
+        # Mutate the backend only after conversion and validation have succeeded.
+        tile.get_analog_ctx().set_indexed(False)
+        tile.rpu_config.drift_compensation = None
+        self.analog_tile_holder.bind(convert_back_to_weights(mapping))
+
+    @staticmethod
+    def _prepare_conversion(tile, g_converter=None):
+        """Validate and prepare conversion without changing the source tile."""
+        if type(tile) is not InferenceTile:
+            raise TypeError("OITile only supports conversion of InferenceTile")
+        if tile.analog_bias:
+            raise ValueError("OITile does not support analog bias; use digital bias")
+        if tile.shared_weights is None:
+            raise ValueError("OITile requires a tile with shared_weights")
+        if tile.in_trans or tile.out_trans:
+            raise ValueError("OITile does not support transposed inputs or outputs")
+        noise = convert_noise_model(getattr(tile.rpu_config, "noise_model", None))
+        if noise is None:
+            raise ValueError("OITile requires a PCM noise model")
+        compensation = convert_compensation(tile.rpu_config.drift_compensation)
+        converter = deepcopy(g_converter if g_converter is not None else noise.g_converter)
+        mapping = convert_to_conductances(converter, AnalogTileHolder(tile).weights())
+        return noise, compensation, converter, mapping
+
+    def _reset_programmed_state(self) -> None:
+        self._programmed: _ProgrammedState | None = None
+        self.active_weights: Tensor | None = None
+        self._compensation_factor: Tensor | None = None
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._reset_programmed_state()
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def _check_apply(self, fn) -> None:
+        current = self.g_plus[0]
+        target = fn(current.new_empty(0))
+        if target.device != current.device or target.dtype != current.dtype:
+            raise RuntimeError(
+                "Move the analog model to the desired device and dtype before OI conversion"
+            )
+
+    def _apply(self, fn, recurse=True):
+        self._check_apply(fn)
+        return super()._apply(fn, recurse)
 
     def get_analog_tile(self) -> InferenceTile:
         """Return the underlying AIHWKIT analog tile."""
@@ -100,7 +138,7 @@ class OITile(nn.Module):
         return self.get_analog_tile().is_cuda
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
         return self.get_analog_tile().device
 
     @property
@@ -120,51 +158,7 @@ class OITile(nn.Module):
     def set_indexed(self, *args, **kwargs) -> None:
         raise NotImplementedError("OITile does not support indexing; use unfolded Conv2d")
 
-    def init_conductances(
-        self,
-        train_significance,
-        g_converter: Optional[BaseConductanceConverter] = None,
-    ) -> None:
-        tile = self.get_analog_tile()
-
-        if tile.shared_weights is None:
-            raise ValueError("OITile requires a tile with shared_weights")
-
-        if g_converter is None:
-            g_converter = tile.rpu_config.noise_model.g_converter
-
-        self.g_converter = deepcopy(g_converter)
-
-        # Read raw tile weights, without mapping or learned output scaling.
-        weights, _ = tile.get_weights(apply_weight_scaling=False)
-        weights = weights.detach().to(
-            device=tile.shared_weights.device,
-            dtype=tile.shared_weights.dtype,
-        )
-
-        # get_weights() returns [out_features, in_features].
-        # Preserve the native layout expected by our installation code.
-        if tile.shared_weights.is_cuda:
-            weights = weights.T
-
-        weights = weights.contiguous().clone()
-
-        if "shared_weights" in tile._parameters:
-            del tile._parameters["shared_weights"]
-
-        # Mutable backend holder, never passed as the autograd weight argument.
-        tile.shared_weights = weights.detach().clone()
-        # CUDA's first shared-weight binding copies backend weights into the
-        # supplied tensor. Complete it using the disposable holder, before any
-        # differentiable programmed/drifted weights are passed to AnalogFunction.
-        tile.ensure_shared_weights()
-
-        # Set by install_conductances().
-        self.active_weights = None
-
-        with torch.no_grad():
-            mapping = convert_to_conductances(self.g_converter, weights)
-
+    def _init_conductances(self, mapping: ConductanceMapping, train_significance: bool) -> None:
         self.g_plus = nn.ParameterList(
             [nn.Parameter(g.detach().clone()) for g in mapping.g_plus]
         )
@@ -172,10 +166,13 @@ class OITile(nn.Module):
             [nn.Parameter(g.detach().clone()) for g in mapping.g_minus]
         )
         self.significance = nn.Parameter(
-            mapping.significance.detach().clone(),
-            requires_grad=train_significance,
+            mapping.significance.detach().clone(), requires_grad=train_significance,
         )
         self.register_buffer("scale", mapping.scale.detach().clone())
+
+    def _tensor_versions(self) -> tuple[tuple[str, int, int], ...]:
+        return tuple((name, id(value), value._version) for name, value in
+                     [*self.named_parameters(), *self.named_buffers()])
 
     def noise_sample(self, kind: str, pair: int, side: str,
                      realization_id: str, t_inference: float = 0.) -> Tensor:
@@ -197,31 +194,31 @@ class OITile(nn.Module):
         generator = torch.Generator(device=g.device).manual_seed(derived)
         return torch.randn(g.shape, generator=generator, device=g.device, dtype=g.dtype)
 
-    def _require_programmed(self):
+    def _require_programmed(self) -> None:
         if self._programmed is None:
             raise RuntimeError("Call program() first")
-        if any(p._version != version for p, version in self._parameter_versions):
+        if self._tensor_versions() != self._programmed.tensor_versions:
             raise RuntimeError("Parameters changed; call program() again")
 
-    def apply_out_scaling(self, values, tensor_view):
+    def _apply_out_scaling(self, values: Tensor, tensor_view: tuple[int, ...]) -> Tensor:
         if self.out_scaling_alpha is not None:
             return values * self.out_scaling_alpha.view(*tensor_view)
         return values
 
-    def analog_forward(self, x_input):
+    def _analog_forward(self, x_input: Tensor) -> Tensor:
         self._require_programmed()
-
-        tile = self.get_analog_tile()
-        return AnalogFunction.apply(
-            tile.get_analog_ctx(),
-            tile,
-            x_input,
-            self.active_weights,
-            not self.training,
+        return self.analog_tile_holder.forward(
+            x_input, self.active_weights, is_test=not self.training,
         )
 
-    def install_conductances(self, gp, gm):
-        self.active_weights = convert_back_to_weights(
+    def _calibration_readout(self) -> Tensor:
+        if self._probe is None:
+            self._probe = self.compensation.get_readout_tensor(self.in_size).to(self.active_weights)
+        output = self.analog_tile_holder.forward(self._probe, self.active_weights, is_test=True)
+        return self.compensation.readout(output)
+
+    def _install_conductances(self, gp: list[Tensor], gm: list[Tensor]) -> None:
+        self.active_weights = _reconstruct_weights(
             ConductanceMapping(
                 g_plus=gp,
                 g_minus=gm,
@@ -239,9 +236,7 @@ class OITile(nn.Module):
         """
         if not isinstance(realization_id, str):
             raise TypeError("realization_id must be a string")
-        self._programmed = None
-        self.active_weights = None
-        self._drifted = False
+        self._reset_programmed_state()
         programmed, coefficients = [], []
         for side, targets in (("plus", self.g_plus), ("minus", self.g_minus)):
             gp, nu = [], []
@@ -252,13 +247,11 @@ class OITile(nn.Module):
                     target, self.noise_sample("drift", pair, side, realization_id)))
             programmed.append(gp)
             coefficients.append(nu)
-        self.install_conductances(*programmed)
-        if self.compensation is not None:
-            self.reference = self.compensation.init_baseline(
-                self.get_analog_tile(), self.active_weights)
-        self._programmed = (programmed, coefficients)
-        self._realization_id = realization_id
-        self._parameter_versions = [(p, p._version) for p in self.parameters()]
+        self._install_conductances(*programmed)
+        reference = self._calibration_readout() if self.compensation is not None else None
+        self._programmed = _ProgrammedState(
+            realization_id, programmed, coefficients, self._tensor_versions(), reference,
+        )
 
     def drift(self, t_inference: float) -> None:
         """Apply drift/read noise from the retained state, without compounding."""
@@ -266,35 +259,32 @@ class OITile(nn.Module):
         t_inference = float(t_inference)
         if not math.isfinite(t_inference) or t_inference < 0:
             raise ValueError("t_inference must be finite and nonnegative")
-        programmed, coefficients = self._programmed
+        state = self._programmed
+        programmed, coefficients = state.conductances, state.coefficients
         drifted = []
         for side, gs, nus in zip(("plus", "minus"), programmed, coefficients):
             drifted.append([
                 self.noise_model.apply_drift_noise_to_conductance(
                     g, nu, t_inference,
-                    self.noise_sample("read", pair, side, self._realization_id, t_inference))
+                    self.noise_sample("read", pair, side, state.realization_id, t_inference))
                 for pair, (g, nu) in enumerate(zip(gs, nus))
             ])
-        self.install_conductances(*drifted)
-        self._drifted = True
+        self._install_conductances(*drifted)
+        self._compensation_factor = None
+        if self.compensation is not None:
+            self._compensation_factor = state.reference / self._calibration_readout()
 
     def forward(
         self, x_input: Tensor, tensor_view: Optional[Tuple[int, ...]] = None
     ) -> Tensor:
 
-        output = self.analog_forward(x_input)
-        if self.compensation is not None and self._drifted:
-            probe = self.compensation.get_readout_tensor(
-                self.get_analog_tile().in_size
-            ).to(self.active_weights)
-            probe_output = self.analog_forward(probe)
-            output = self.compensation.apply(
-                probe_output, self.reference, output
-            )
+        output = self._analog_forward(x_input)
+        if self._compensation_factor is not None:
+            output = output * self._compensation_factor
 
         if tensor_view is None:
             tensor_view = self.get_analog_tile().get_tensor_view(output.dim())
-        out = self.apply_out_scaling(output, tensor_view)
+        out = self._apply_out_scaling(output, tensor_view)
 
         if self.digital_bias:
             return out + self.bias.view(*tensor_view)
@@ -307,47 +297,15 @@ class OITile(nn.Module):
                 g.clamp_(self.g_converter.g_min, self.g_converter.g_max)
 
     @torch.no_grad()
-    def clamp_significance(self):
+    def clamp_significance(self) -> None:
         self.significance.clamp_(0.1, 5.0)
 
-    def to_analog(self):
+    def to_analog(self) -> InferenceTile:
+        """Export independent weights, digital parameters, and cached calibration."""
         self._require_programmed()
-
-        tile = deepcopy(self.get_analog_tile())
-        # Bind the copy's disposable holder before supplying snapshot weights;
-        # its first binding may otherwise overwrite them with backend state.
-        tile.ensure_shared_weights()
-
-        # Independent storage, registered for ordinary PyTorch handling.
-        tile.shared_weights = nn.Parameter(
-            self.active_weights.detach().clone(),
-            requires_grad=False,
+        tile = self.analog_tile_holder.snapshot(
+            self.active_weights, self._compensation_factor, self._programmed.reference,
         )
-
-        with torch.no_grad():
-            tile.alpha = torch.ones_like(tile.alpha)
-            if self.compensation is not None and self._drifted:
-                probe = self.compensation.get_readout_tensor(
-                    tile.in_size
-                ).to(tile.shared_weights)
-
-                # Stock compensation is still disabled here.
-                probe_output = AnalogFunction.apply(
-                    tile.get_analog_ctx(),
-                    tile,
-                    probe,
-                    tile.shared_weights,
-                    True,
-                )
-
-                current_readout = self.compensation.readout(probe_output)
-                tile.alpha = (
-                    self.reference / current_readout
-                ).detach().clone()
-                tile.drift_baseline = self.reference.detach().clone()
-
-            # Bind the exported weights even when compensation is disabled.
-            tile.ensure_shared_weights(tile.shared_weights)
 
         tile.rpu_config.drift_compensation = deepcopy(
             self.original_drift_compensation

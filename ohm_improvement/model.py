@@ -3,7 +3,7 @@
 from copy import deepcopy
 import hashlib
 import math
-from typing import TypeAlias
+from typing import Iterator, TypeAlias
 
 import torch
 from torch import nn
@@ -15,8 +15,9 @@ from aihwkit.nn.modules.conv_mapped import (
 from aihwkit.simulator.tiles.array import TileModuleArray
 from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.simulator.tiles.inference import InferenceTile
+from aihwkit.simulator.tiles.base import TileModuleBase
 
-from .tiles import OITile
+from .tiles import OITile, _validate_seed
 
 # AIHWKIT's common base covers AnalogWrapper, AnalogSequential, and standalone
 # analog layers (e.g. AnalogLinear), without accepting arbitrary digital modules.
@@ -35,10 +36,13 @@ class OIModel(nn.Module):
         for layer in analog_model.modules():
             if isinstance(layer, (AnalogConv1d, AnalogConv3d, AnalogConv1dMapped, AnalogConv3dMapped)):
                 raise NotImplementedError("OI supports unfolded Conv2d only; indexed convolutions are unsupported")
+            if isinstance(layer, TileModuleBase):
+                if isinstance(layer, TileModuleArray):
+                    continue
+                OITile._prepare_conversion(layer, g_converter)
         if seed is None:
             seed = torch.randint(0, 2**63 - 1, ()).item()
-        elif type(seed) is not int or not 0 <= seed < 2**63:
-            raise ValueError("seed must be an integer in [0, 2**63)")
+        _validate_seed(seed)
         model = analog_model if inplace else deepcopy(analog_model)
         converted = {}
 
@@ -68,13 +72,19 @@ class OIModel(nn.Module):
     def forward(self, *args, **kwargs):
         return self._model(*args, **kwargs)
 
-    def named_oi_tiles(self):
+    def _apply(self, fn, recurse=True):
+        # Preflight every tile before changing any registered model tensors.
+        for tile in self.oi_tiles():
+            tile._check_apply(fn)
+        return super()._apply(fn, recurse)
+
+    def named_oi_tiles(self) -> Iterator[tuple[str, OITile]]:
         """Yield tile names relative to the retained original analog model."""
         for name, tile in self._model.named_modules():
             if isinstance(tile, OITile):
                 yield name, tile
 
-    def oi_tiles(self):
+    def oi_tiles(self) -> Iterator[OITile]:
         for _, tile in self.named_oi_tiles():
             yield tile
 
@@ -153,8 +163,19 @@ class OIModel(nn.Module):
                     groups["bias"]["params"].append(module.bias)
 
         result = []
+        owners = {}
         for name, group in groups.items():
-            parameters = [p for p in group["params"] if p.requires_grad]
+            parameters = []
+            for parameter in group["params"]:
+                if not parameter.requires_grad:
+                    continue
+                owner = owners.get(id(parameter))
+                if owner is not None:
+                    if owner != name:
+                        raise ValueError(f"A parameter belongs to both {owner!r} and {name!r} groups")
+                    continue
+                owners[id(parameter)] = name
+                parameters.append(parameter)
             if parameters:
                 result.append(dict(name=name, params=parameters, lr=group["lr"]))
         return result

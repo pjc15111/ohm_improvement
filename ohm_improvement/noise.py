@@ -1,3 +1,5 @@
+"""PCM noise equations with caller-supplied samples and autograd support."""
+
 from aihwkit.inference.converter.base import BaseConductanceConverter
 from aihwkit.inference.converter.conductance import SinglePairConductanceConverter
 
@@ -12,77 +14,19 @@ from copy import deepcopy
 
 
 class DifferentiablePCMLikeNoiseModel:
-    r"""PCM programming, drift, and read-noise model
-    with autograd support.
+    """Differentiable PCM equations adapted from AIHWKIT's PCMLikeNoiseModel.
 
-    Adapted from AIHWKIT's PCMLikeNoiseModel.
-
-    Changes from the original:
-        1. Remove @no_grad from all methods.
-        2. Accept noise tensors as arguments instead of sampling
-           internally, allowing the use of common random numbers.
-        3. Avoid in-place arithmetic in the programming-noise
-           calculation.
-        4. Clamp before the fractional power in the read-noise
-           calculation to prevent invalid gradients at zero
-           conductance.
-        5. We no longer extend BaseNoiseModel.
-        6. Fixed a bug that caused self.prog_coeff_g_max_reference
-           to not be initialized when both prog_coeff_g_max_reference
-           and prog_coeff are not None.
-
-    The statistical equations and default parameters otherwise follow
-    the original model.
-
-    Timing parameters are ordinary scalars. Gradients are supported
-    with respect to conductances and drift coefficients, not with
-    respect to time.
-
-    Most changes from the original model are documented with 'CHANGE:'.
-    Small changes that do not affect semantics (e.g. translating
-    `torch_abs` to `torch.abs`) are not documented. All comments aside
-    from this block and those marked with CHANGE: are from the
-    original.
-
-    Known documentation defects inherited from AIHWKIT'PCMLikeNoiseModel:
-    - The programming-noise polynomial specifies the standard deviation,
-      not the variance: its value multiplies a standard-normal sample.
-    - The polynomial is quadratic only for the default coefficients;
-      custom coefficients can specify a different degree.
-    - The constructor documentation refers to "prog_coeffs", but the
-      argument is named "prog_coeff".
-
-    Original documentation follows.
-
-    Args:
-        prog_coeff: Programming polynomial coeffs in
-            :math:`\sum_i c_i \left(\frac{g_t}{g_\max}\right)^i`
-        g_converter: instantiated class of the conductance converter
-            (defaults to single pair)
-        g_max: In :math:`\mu S`, the maximal conductance, ie the value
-            the absolute max of the weights will be mapped to.
-        t_read: Parameter of the 1/f fit (in seconds).
-        t_0: Parameter of the drift fit (first reading time).
-
-            Note:
-                The ``t_inference`` is relative to this time `t0`
-                e.g. t_inference counts from the completion of the programming
-                of a device.
-        prog_noise_scale: Scale for the programming noise.
-        read_noise_scale: Scale for the read and accumulated noise.
-        drift_scale: Scale for the  drift coefficient.
-        prog_coeff_g_max_reference: reference :math:`g_\max` value
-            when fitting the coefficients, since the result of the
-            polynomial fit is given in uS. If
-            ``prog_coeff_g_max_reference`` is not given and
-            `prog_coeffs` are given explicitly, it will be set to
-            ``g_max`` of the conductance converter.
-
+    Callers supply standard-normal tensors for programming, drift coefficients,
+    and read noise. Timing parameters are scalars; gradients are supported with
+    respect to conductances and drift coefficients, not time. The programming
+    polynomial describes standard deviation and supports arbitrary degree.
+    Conductances and their maximum/reference values are in microsiemens.
+    ``t_0`` is the first-read time after programming; inference times are
+    measured relative to it. ``t_read`` controls the accumulated read-noise fit.
+    ``prog_coeff_g_max_reference`` is the conductance maximum used to fit the
+    programming polynomial; default coefficients were fitted at 25 microsiemens.
     """
 
-    # CHANGE: Define the original numerical floor locally rather than
-    # importing AIHWKIT's private module-level _ZERO_CLIP constant.
-    # Its value is unchanged.
     _ZERO_CLIP = 1e-7
 
     def __init__(
@@ -97,8 +41,6 @@ class DifferentiablePCMLikeNoiseModel:
         drift_scale: float = 1.0,
         prog_coeff_g_max_reference: Optional[float] = None,
     ):
-        # CHANGE: Store the converter directly instead of relying on
-        # BaseNoiseModel.__init__.
         self.g_converter = deepcopy(g_converter) or SinglePairConductanceConverter(g_max=g_max)
 
         self.g_max = getattr(self.g_converter, "g_max", g_max)
@@ -107,8 +49,6 @@ class DifferentiablePCMLikeNoiseModel:
 
         if prog_coeff_g_max_reference is None:
             self.prog_coeff_g_max_reference = self.g_max
-        # CHANGE: Use the value of prog_coeff_g_max_reference if it is
-        # not none.
         else:
             self.prog_coeff_g_max_reference = prog_coeff_g_max_reference
 
@@ -126,50 +66,32 @@ class DifferentiablePCMLikeNoiseModel:
         self.read_noise_scale = read_noise_scale
         self.drift_scale = drift_scale
 
-    # CHANGE: No @no_grad decorator
     def apply_programming_noise_to_conductance(
         self,
         g_target: Tensor,
         randn: Tensor,
     ) -> Tensor:
-        """Apply programming noise to a target conductance Tensor.
-
-        Programming noise with additive Gaussian noise with
-        conductance dependency of the variance given by a 2-degree
-        polynomial.
-        """
-        # CHANGE: The original samples randn_like(g_target) internally.
-        # We instead receive randn as an argument, allowing reuse of
-        # random samples.
+        """Add Gaussian noise with conductance-dependent standard deviation."""
 
         mat = 1
         sig_prog = self.prog_coeff[0]
         for coeff in self.prog_coeff[1:]:
-            # CHANGE: Use out-of-place operations instead of *= and +=.
-            # Mutating values can invalidate values saved by autograd
-            # for the backward pass.
             mat = mat * (g_target / self.g_max)
             sig_prog = sig_prog + mat * coeff
 
-        # CHANGE: Out-of-place scaling for the same reason.
         sig_prog = sig_prog * (
             self.g_max / self.prog_coeff_g_max_reference
-        )  # type: ignore
+        )
         g_prog = g_target + self.prog_noise_scale * sig_prog * randn
 
-        # CHANGE: Use clamp rather than clamp_ to avoid mutating an
-        # intermediate tensor.
         return g_prog.clamp(min=0.0)  # no negative conductances allowed
 
-    # CHANGE: Remove @no_grad decorator
     def generate_drift_coefficients(
         self,
         g_target: Tensor,
         randn: Tensor
     ) -> Tensor:
         """Return drift coefficients ``nu`` based on PCM measurements."""
-        # CHANGE: randn is supplied by the caller rather than generated
-        # internally to allow reuse of random numbers.
 
         g_relative = torch.clamp(
             torch.abs(g_target / self.g_max), min=self._ZERO_CLIP
@@ -182,7 +104,6 @@ class DifferentiablePCMLikeNoiseModel:
 
         return nu_drift * self.drift_scale
 
-    # CHANGE: No @no_grad decorator
     def apply_drift_noise_to_conductance(
         self,
         g_prog: Tensor,
@@ -192,8 +113,6 @@ class DifferentiablePCMLikeNoiseModel:
     ) -> Tensor:
         """Apply the noise and drift up to the assumed inference time
         point based on PCM measurements."""
-        # CHANGE: randn is supplied by the caller rather than generated
-        # internally to allow reuse of random numbers.
         t = t_inference + self.t_0
 
         # drift
@@ -204,8 +123,6 @@ class DifferentiablePCMLikeNoiseModel:
 
         # expected accumulated 1/f noise since start of programming at t=0
         if t > 0:
-            # CHANGE: Clamp BEFORE the fractional power.
-            #
             # Original:
             #   relative.pow(0.65).clamp(min=1e-3)
             #
@@ -251,5 +168,5 @@ def convert_noise_model(noise_model):
         )
 
     raise TypeError(
-        f"Unsupported drift compensation: {type(noise_model).__name__}"
+        f"Unsupported noise model: {type(noise_model).__name__}"
     )

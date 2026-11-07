@@ -151,3 +151,25 @@ def test_custom_mapping_preserves_nonzero_common_mode(device):
     torch.testing.assert_close(mapping.g_plus[0], weights.new_tensor([[5., 7.5, 10., 17.5, 25.]]))
     torch.testing.assert_close(mapping.g_minus[0], weights.new_tensor([[25., 17.5, 10., 7.5, 5.]]))
     torch.testing.assert_close(convert_back_to_weights(mapping), weights)
+
+
+@pytest.mark.parametrize('scale', [torch.tensor([1., 2.]), torch.tensor(0.),
+                                  torch.tensor(-1.), torch.tensor(float('nan')),
+                                  torch.tensor(float('inf'))])
+def test_invalid_conversion_scale_is_rejected(scale):
+    mapping = ConductanceMapping([torch.ones(2, 2)], [torch.zeros(2, 2)], torch.ones(1), scale)
+    with pytest.raises(ValueError, match='scale'):
+        convert_back_to_weights(mapping)
+
+
+def test_broadcastable_conductance_shapes_are_rejected():
+    mapping = ConductanceMapping([torch.ones(2, 1)], [torch.zeros(1, 2)], torch.ones(1), torch.tensor(1.))
+    with pytest.raises(ValueError, match='same shape'):
+        convert_back_to_weights(mapping)
+
+
+def test_mixed_mapping_dtypes_are_rejected():
+    mapping = ConductanceMapping([torch.ones(2)], [torch.zeros(2, dtype=torch.float64)],
+                                 torch.ones(1), torch.tensor(1.))
+    with pytest.raises(ValueError, match='device and dtype'):
+        convert_back_to_weights(mapping)

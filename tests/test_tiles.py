@@ -368,3 +368,196 @@ def test_export_before_first_forward(device, compensation, drift):
         wrapped.drift(86400.)
     x = torch.tensor([[.2, -.4, .8]], device=device)
     torch.testing.assert_close(wrapped.to_analog()(x), wrapped(x))
+
+
+@pytest.mark.parametrize("mapping", ["none", "tile", "column"])
+@pytest.mark.parametrize("lr_compensation", [False, True])
+@pytest.mark.parametrize("compensation", [False, True])
+def test_gradients_match_torch_reference(device, mapping, lr_compensation, compensation):
+    """Compare mathematical derivatives, independently of AIHWKIT update gradients."""
+    config = InferenceRPUConfig()
+    config.forward.is_perfect = True
+    config.mapping.weight_scaling_omega = 0. if mapping == "none" else .7
+    config.mapping.weight_scaling_columnwise = mapping == "column"
+    config.mapping.weight_scaling_lr_compensation = lr_compensation
+    config.mapping.learn_out_scaling = True
+    config.mapping.out_scaling_columnwise = True
+    config.noise_model.g_converter = NPairConductanceConverter([1., 2.])
+    config.drift_compensation = GlobalDriftCompensation() if compensation else None
+    original = InferenceTile(2, 3, config, bias=True).to(device)
+    original.set_weights(torch.tensor([[.3, -.2, .1], [-.7, .15, .25]]), torch.tensor([.07, -.09]))
+    wrapped = OITile(original, seed=11).eval()
+    wrapped.program("reference")
+    programmed = wrapped.active_weights
+    wrapped.drift(86400.)
+    x = torch.tensor([[[.2, -.4, .8], [.7, .1, -.3]]], device=device, requires_grad=True)
+    tile = wrapped.get_analog_tile()
+    scales = tile.get_mapping_scales()
+    if scales is None:
+        scales = x.new_ones(1)
+
+    def matmul(inputs, weights):
+        return inputs @ (weights if tile.is_cuda else weights.T) * scales
+
+    expected = matmul(x, wrapped.active_weights)
+    if compensation:
+        probe = torch.eye(3, device=device)
+        reference = matmul(probe, programmed).abs().mean().clamp(min=1e-4)
+        current = matmul(probe, wrapped.active_weights).abs().mean().clamp(min=1e-4)
+        expected = expected * (reference / current)
+    expected = expected * wrapped.out_scaling_alpha + wrapped.bias
+    actual = wrapped(x)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    parameters = [*wrapped.g_plus, *wrapped.g_minus, wrapped.significance,
+                  wrapped.bias, wrapped.out_scaling_alpha, x]
+    actual_gradients = torch.autograd.grad(actual.square().sum(), parameters, retain_graph=True)
+    expected_gradients = torch.autograd.grad(expected.square().sum(), parameters)
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient, atol=2e-6, rtol=2e-4)
+
+
+@pytest.mark.parametrize("assign", [False, True])
+def test_checkpoint_loading_invalidates_programming(device, assign):
+    wrapped = OITile(make_tile(device, compensation=True), seed=17)
+    prepare(wrapped, "test1", 0.)
+    state = {name: value.detach().clone() for name, value in wrapped.state_dict().items()}
+    state["significance"] *= 2
+    wrapped.load_state_dict(state, assign=assign)
+    with pytest.raises(RuntimeError, match="Call program"):
+        wrapped(torch.ones(1, 3, device=device))
+    with pytest.raises(RuntimeError, match="Call program"):
+        wrapped.drift(0.)
+    prepare(wrapped, "test1", 0.)
+    assert torch.isfinite(wrapped(torch.ones(1, 3, device=device))).all()
+
+
+def test_replacing_parameters_or_buffers_invalidates_programming():
+    wrapped = OITile(make_tile(torch.device("cpu")), seed=17)
+    for name in ["significance", "scale", "noise_seed"]:
+        wrapped.program("test1")
+        value = getattr(wrapped, name).detach().clone()
+        setattr(wrapped, name, nn.Parameter(value) if name == "significance" else value)
+        with pytest.raises(RuntimeError, match="Parameters changed"):
+            wrapped.drift(0.)
+
+
+@pytest.mark.parametrize("seed", [-1, 2**63, True, 1.5])
+def test_invalid_seed_does_not_mutate_tile(seed):
+    tile = make_tile(torch.device("cpu"), compensation=True)
+    compensation = tile.rpu_config.drift_compensation
+    weights = tile.shared_weights
+    tile.get_analog_ctx().set_indexed(True)
+    with pytest.raises(ValueError, match="seed"):
+        OITile(tile, seed=seed)
+    assert tile.shared_weights is weights
+    assert tile.rpu_config.drift_compensation is compensation
+    assert tile.get_analog_ctx().use_indexed
+
+
+@pytest.mark.parametrize("unsupported", ["bias", "noise", "missing_noise", "compensation"])
+def test_unsupported_configuration_does_not_mutate_tile(unsupported):
+    config = InferenceRPUConfig()
+    config.mapping.digital_bias = unsupported != "bias"
+    tile = InferenceTile(2, 3, config, bias=True)
+    if unsupported == "noise":
+        tile.rpu_config.noise_model = object()
+    elif unsupported == "missing_noise":
+        tile.rpu_config.noise_model = None
+    elif unsupported == "compensation":
+        tile.rpu_config.drift_compensation = object()
+    compensation = tile.rpu_config.drift_compensation
+    weights = tile.shared_weights
+    tile.get_analog_ctx().set_indexed(True)
+    with pytest.raises((ValueError, TypeError), match="bias|noise|compensation"):
+        OITile(tile, seed=1)
+    assert tile.shared_weights is weights
+    assert tile.rpu_config.drift_compensation is compensation
+    assert tile.get_analog_ctx().use_indexed
+
+
+def test_compensation_calibrates_once_per_program_and_drift(monkeypatch, device):
+    wrapped = OITile(make_tile(device, compensation=True, noisy=True), seed=1)
+    calls = []
+    forward = wrapped.analog_tile_holder.forward
+
+    def count_forward(*args, **kwargs):
+        calls.append(args[0].shape)
+        return forward(*args, **kwargs)
+
+    monkeypatch.setattr(wrapped.analog_tile_holder, "forward", count_forward)
+    wrapped.program("test1")
+    assert len(calls) == 1
+    probe = wrapped._probe
+    wrapped.drift(86400.)
+    assert len(calls) == 2
+    factor = wrapped._compensation_factor
+    x = torch.ones(1, 3, device=device)
+    first = wrapped(x)
+    second = wrapped(x)
+    assert len(calls) == 4
+    assert wrapped._compensation_factor is factor
+    exported = wrapped.to_analog()
+    assert len(calls) == 4  # Export preserves calibration rather than resampling it.
+    torch.testing.assert_close(exported.alpha, factor)
+    torch.testing.assert_close(first, second)
+    (first.sum() + second.sum()).backward()
+    wrapped.program("test2")
+    wrapped.drift(86400.)
+    assert wrapped._probe is probe
+    assert wrapped._compensation_factor is not factor
+
+
+def test_dtype_movement_rejected_before_mutation():
+    wrapped = OITile(make_tile(torch.device("cpu")), seed=17)
+    wrapped.program("test1")
+    identities = [id(p) for p in wrapped.parameters()]
+    with pytest.raises(RuntimeError, match="before OI conversion"):
+        wrapped.double()
+    assert identities == [id(p) for p in wrapped.parameters()]
+    assert all(p.dtype == torch.float32 for p in wrapped.parameters())
+    wrapped.to("cpu")
+    assert torch.isfinite(wrapped(torch.ones(1, 3))).all()
+
+
+@pytest.mark.parametrize("compensation", [False, True])
+def test_conductance_and_significance_gradients_match_finite_differences(device, compensation):
+    wrapped = OITile(make_tile(device, compensation=compensation), seed=19).eval()
+    # Stay away from conductance clamps for a two-sided derivative.
+    with torch.no_grad():
+        for parameter in [*wrapped.g_plus, *wrapped.g_minus]:
+            parameter.add_(2.)
+    x = torch.tensor([[.2, -.4, .8]], device=device)
+
+    def objective():
+        prepare(wrapped, "finite-difference", 86400.)
+        return wrapped(x).square().sum()
+
+    parameters = [*wrapped.g_plus, *wrapped.g_minus, wrapped.significance]
+    gradients = torch.autograd.grad(objective(), parameters)
+    for parameter, gradient in zip(parameters, gradients):
+        epsilon = .01 if parameter.ndim == 2 else .001
+        with torch.no_grad():
+            original = parameter.flatten()[0].item()
+            parameter.flatten()[0] = original + epsilon
+            plus = objective().item()
+            parameter.flatten()[0] = original - epsilon
+            minus = objective().item()
+            parameter.flatten()[0] = original
+        expected = (plus - minus) / (2 * epsilon)
+        torch.testing.assert_close(gradient.flatten()[0], gradient.new_tensor(expected),
+                                   atol=2e-5, rtol=5e-3)
+
+
+def test_failed_converter_does_not_mutate_source_tile():
+    tile = make_tile(torch.device("cpu"), compensation=True)
+    weights = tile.shared_weights
+    compensation = tile.rpu_config.drift_compensation
+
+    class BrokenConverter:
+        def convert_to_conductances(self, weights):
+            return [torch.ones(1, 2), torch.ones(2, 1)], {"scale_ratio": torch.tensor(1.)}
+
+    with pytest.raises(ValueError, match="same shape"):
+        OITile(tile, BrokenConverter(), seed=1)
+    assert tile.shared_weights is weights
+    assert tile.rpu_config.drift_compensation is compensation

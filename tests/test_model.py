@@ -278,3 +278,47 @@ def test_oi_checkpoint_restores_named_noise():
     for a, b in zip(first.oi_tiles(), restored.oi_tiles()):
         torch.testing.assert_close(a.noise_seed, b.noise_seed)
         torch.testing.assert_close(a.active_weights, b.active_weights)
+
+
+def test_tied_parameters_are_gathered_once():
+    model = OIModel(make_model())
+    first, second = list(model.oi_tiles())
+    second.significance = first.significance
+    groups = model.optimization_parameters()
+    parameters = [parameter for group in groups for parameter in group['params']]
+    assert len(parameters) == len({id(parameter) for parameter in parameters})
+    assert sum(p is first.significance for p in parameters) == 1
+
+
+def test_conflicting_parameter_groups_are_rejected():
+    model = OIModel(make_model())
+    tile = next(model.oi_tiles())
+    tile.out_scaling_alpha = tile.significance
+    with pytest.raises(ValueError, match="both.*significance.*output_scaling"):
+        model.optimization_parameters()
+
+
+def test_inplace_conversion_preflights_all_tiles():
+    original = make_model()
+    tiles = list(original.analog_tiles())
+    weights = [tile.shared_weights for tile in tiles]
+    compensations = [tile.rpu_config.drift_compensation for tile in tiles]
+    tiles[-1].rpu_config.noise_model = None
+    with pytest.raises(ValueError, match="noise model"):
+        OIModel(original, seed=1, inplace=True)
+    assert not any(isinstance(module, OITile) for module in original.modules())
+    for tile, weight, compensation in zip(tiles, weights, compensations):
+        assert tile.shared_weights is weight
+        assert tile.rpu_config.drift_compensation is compensation
+
+
+def test_model_dtype_movement_is_atomic():
+    model = OIModel(make_model())
+    model.program("test1")
+    identities = [id(p) for p in model.parameters()]
+    with pytest.raises(RuntimeError, match="before OI conversion"):
+        model.double()
+    assert identities == [id(p) for p in model.parameters()]
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    assert all(tile.get_analog_tile().shared_weights.dtype == torch.float32 for tile in model.oi_tiles())
+    assert torch.isfinite(model(torch.ones(1, 3))).all()
