@@ -15,7 +15,7 @@ from aihwkit.nn.conversion import convert_to_analog
 import ohm_improvement as oi
 from experiments.mnist.common import (
     load_digital_model, log_commit, make_loaders, make_rpu_config, report_metrics,
-    select_device, synchronize_device,
+    select_device, synchronize_device, configure_cpu_threads,
     TRAINING_TIMES, UNSEEN_TIMES, evaluation_times,
 )
 from experiments.common import (
@@ -254,6 +254,7 @@ def main(argv=None):
     start = perf_counter()
     torch.manual_seed(args.seed)
     device = select_device(args.no_accel)
+    configure_cpu_threads(device)
     print(f'Device: {torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"}', flush=True)
     # Convert every initialization on CPU so paired CPU/GPU runs receive identical
     # normalized tile weights before transferring them to their execution device.

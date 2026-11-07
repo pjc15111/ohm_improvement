@@ -36,7 +36,7 @@ print(1000 + len(path.read_text().splitlines()))
     sbatch.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
            if key not in {'RUNS', 'DIGITAL_EPOCHS', 'OI_EPOCHS', 'HAT_EPOCHS', 'WPO_MEM',
-                          'NOISE_MODE', 'OI_LONG_EPOCHS', 'GPU_TIME', 'WPO_TIME', 'SEED_BASE', 'WPO_WORKERS'}}
+                          'NOISE_MODE', 'OI_LONG_EPOCHS', 'GPU_TIME', 'CPU_TIME', 'WPO_TIME', 'SEED_BASE', 'WPO_WORKERS'}}
     if wpo_workers is not None:
         env['WPO_WORKERS'] = wpo_workers
     if seed_base is not None:
@@ -71,12 +71,15 @@ print(1000 + len(path.read_text().splitlines()))
         assert '--array=1-5' in args
         assert '--kill-on-invalid-dep=yes' in args
         assert not any(arg.startswith('--constraint') for arg in args)
+        assert not any(arg.startswith('--gres') for arg in args)
+        assert '--partition=test-cpu' in args
+        assert '--cpus-per-task=64' in args
+        assert '--hint=nomultithread' in args
         assert '--time=02:00:00' in args
     for args in [digital, hat, *ois]:
-        assert '--gres=gpu:1' in args and '--partition=test-gpu' in args
         assert '--mem=16G' in args
     assert all('--partition=test-cpu' in job for job in wpos)
-    assert all(f'--cpus-per-task={wpo_workers or "64"}' in job for job in wpos)
+    assert all('--cpus-per-task=64' in job for job in wpos)
     assert all(f'--mem={wpo_mem or "64G"}' in job for job in wpos)
     assert all('--hint=nomultithread' in job for job in wpos)
     assert digital[-1] == '10'
@@ -102,7 +105,10 @@ print(1000 + len(path.read_text().splitlines()))
 def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path):
     python_bin = tmp_path / 'venv' / 'bin' / 'python'
     python_bin.parent.mkdir(parents=True)
-    python_bin.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+    python_bin.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                          'assert all(os.environ[name] == "64" for name in '
+                          '["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"])\n'
+                          'print(json.dumps(sys.argv[1:]))\n')
     python_bin.chmod(0o755)
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
@@ -110,7 +116,7 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
     git.write_text('#!/bin/sh\nprintf "test-commit\\n"\n')
     git.chmod(0o755)
     env = {**os.environ, 'SLURM_ARRAY_TASK_ID': '2', 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
-           'WPO_WORKERS': '1'}
+           'WPO_WORKERS': '1', 'SLURM_CPUS_PER_TASK': '64'}
     conditions = [('digital', ['10']), ('hat', ['10']),
                   ('oi', ['10', 'hat', 'fresh']), ('oi', ['20', 'hat', 'fresh']),
                   ('oi', ['10', 'digital', 'fresh']), ('oi', ['20', 'digital', 'fresh']),
@@ -123,6 +129,7 @@ def test_runner_uses_fresh_training_seed_and_one_shared_hat_checkpoint(tmp_path)
         commands.append(json.loads(completed.stdout.splitlines()[-1]))
     shared_hat = commands[1][commands[1].index('--output-checkpoint') + 1]
     for (phase, arguments), argv in zip(conditions, commands):
+        assert '--no-accel' in argv
         assert argv[argv.index('--seed') + 1] == '123458'
         assert argv[argv.index('--checkpoint') + 1].endswith('/checkpoints/seed-2.pt')
         if phase in ['oi', 'wpo']:

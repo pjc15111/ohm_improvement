@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Submit independent digital, WPO, and OI arrays; no GPU type/concurrency cap.
+# Submit CPU-only digital, HAT, WPO, and OI arrays with 64 physical CPUs per job.
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -8,9 +8,8 @@ epochs=${DIGITAL_EPOCHS:-10}
 oi_epochs=${OI_EPOCHS:-10}
 oi_long_epochs=${OI_LONG_EPOCHS:-20}
 hat_epochs=${HAT_EPOCHS:-10}
-gpu_partition=${GPU_PARTITION:-general-gpu}
 cpu_partition=${CPU_PARTITION:-general}
-gpu_time=${GPU_TIME:-02:00:00}
+cpu_time=${CPU_TIME:-02:00:00}
 wpo_time=${WPO_TIME:-02:00:00}
 noise_mode=${NOISE_MODE:-fresh}
 wpo_mem=${WPO_MEM:-64G}
@@ -29,8 +28,8 @@ if [[ ! $hat_epochs =~ ^[0-9]+$ ]]; then
     echo 'HAT_EPOCHS must be a nonnegative integer' >&2
     exit 1
 fi
-if [[ ! $wpo_workers =~ ^[1-9][0-9]*$ ]]; then
-    echo 'WPO_WORKERS must be a positive integer' >&2
+if [[ ! $wpo_workers =~ ^[1-9][0-9]*$ ]] || ((wpo_workers > 64)); then
+    echo 'WPO_WORKERS must be an integer in [1, 64]' >&2
     exit 1
 fi
 if [[ ! $seed_base =~ ^(0|[1-9][0-9]*)$ || ${#seed_base} -gt 10 ]] || ((seed_base > 4294967295)); then
@@ -48,7 +47,8 @@ done
 cd "$repo_dir"
 runner=$repo_dir/experiments/mnist/run.slurm
 array=(--array="1-$runs" --kill-on-invalid-dep=yes)
-resources=(--nodes=1 --ntasks=1 --chdir="$repo_dir")
+resources=(--nodes=1 --ntasks=1 --chdir="$repo_dir" --partition="$cpu_partition"
+           --cpus-per-task=64 --hint=nomultithread)
 
 submit() {
     local job_id
@@ -57,14 +57,13 @@ submit() {
 }
 
 digital=$(submit "${array[@]}" "${resources[@]}" \
-    --job-name=mnist-digital --partition="$gpu_partition" --gres=gpu:1 \
-    --cpus-per-task=4 --mem=16G --time="$gpu_time" --output="$run_dir/seed-%a/digital.log" \
+    --job-name=mnist-digital --mem=16G --time="$cpu_time" --output="$run_dir/seed-%a/digital.log" \
     "$runner" digital "$run_dir" "$seed_base" "$epochs")
 
-# Finish all baseline training before HAT, then finish all HAT before any OI.
+# Retain shared-checkpoint staging: digital, then HAT, then OI.
 hat=$(submit "${array[@]}" "${resources[@]}" \
     --dependency="afterok:$digital" --job-name=mnist-hat \
-    --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --mem=16G --time="$gpu_time" \
+    --mem=16G --time="$cpu_time" \
     --output="$run_dir/seed-%a/hat.log" "$runner" hat "$run_dir" "$seed_base" "$hat_epochs")
 
 printf 'Seed base: %s\nDigital: %s\nHAT: %s\n' "$seed_base" "$digital" "$hat"
@@ -77,7 +76,7 @@ for initialization in digital hat; do
     label="wpo-$initialization"
     job=$(submit "${array[@]}" "${resources[@]}" \
         --dependency="aftercorr:$dependency" --job-name="mnist-$label" \
-        --partition="$cpu_partition" --cpus-per-task="$wpo_workers" --hint=nomultithread --mem="$wpo_mem" --time="$wpo_time" \
+        --mem="$wpo_mem" --time="$wpo_time" \
         --output="$run_dir/seed-%a/$label.log" "$runner" wpo "$run_dir" "$seed_base" "$initialization")
     cleanup_dependencies+=":$job"
     printf '%s: %s\n' "$label" "$job"
@@ -85,7 +84,7 @@ for initialization in digital hat; do
         label="oi-$initialization-e$training_epochs"
         job=$(submit "${array[@]}" "${resources[@]}" \
             --dependency="afterok:$hat" --job-name="mnist-$label" \
-            --partition="$gpu_partition" --gres=gpu:1 --cpus-per-task=4 --mem=16G --time="$gpu_time" \
+            --mem=16G --time="$cpu_time" \
             --output="$run_dir/seed-%a/$label.log" "$runner" oi "$run_dir" "$seed_base" \
             "$training_epochs" "$initialization" "$noise_mode")
         cleanup_dependencies+=":$job"

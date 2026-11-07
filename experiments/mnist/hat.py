@@ -17,7 +17,7 @@ from experiments.common import evaluate_classifier
 from experiments.history import ExperimentHistory, HistoryRecord
 from experiments.mnist.common import (
     load_digital_model, log_commit, make_loaders, make_rpu_config,
-    report_metrics, select_device, synchronize_device,
+    report_metrics, select_device, synchronize_device, configure_cpu_threads,
 )
 from ohm_improvement import AnalogModel
 
@@ -149,6 +149,7 @@ def main(argv=None):
     log_commit()
     torch.manual_seed(args.seed)
     device = select_device(args.no_accel)
+    configure_cpu_threads(device)
     print(f'HAT device: {device}', flush=True)
     digital = load_digital_model(args.checkpoint, torch.device('cpu'))
     train_loader, test_loader = make_loaders(args, device)

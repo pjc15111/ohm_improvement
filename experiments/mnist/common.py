@@ -1,6 +1,7 @@
 """Model, data, and reporting shared by the MNIST experiments."""
 
 import subprocess
+import os
 from pathlib import Path
 
 import torch
@@ -62,6 +63,13 @@ def synchronize_device(device):
     """Include completed GPU work in history timestamps."""
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
+
+
+def configure_cpu_threads(device):
+    """Use the allocated CPU count even when the PyTorch build caps defaults."""
+    if device.type == 'cpu' and 'SLURM_CPUS_PER_TASK' in os.environ:
+        torch.set_num_threads(int(os.environ['SLURM_CPUS_PER_TASK']))
+        print(f'PyTorch CPU threads: {torch.get_num_threads()}', flush=True)
 
 
 def log_commit():

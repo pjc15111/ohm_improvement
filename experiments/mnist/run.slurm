@@ -24,6 +24,8 @@ python_bin=$PWD/venv/bin/python
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export MKL_NUM_THREADS=$OMP_NUM_THREADS
+export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
+printf 'CPU threads: %s\n' "$OMP_NUM_THREADS"
 
 checkpoint=$run_dir/checkpoints/seed-$replicate.pt
 label=$phase
@@ -35,7 +37,7 @@ fi
 results=$run_dir/seed-$replicate/$label.json
 hat_checkpoint=$run_dir/checkpoints/hat-seed-$replicate.pt
 data_dir=${MNIST_DATA:-$PWD/data}
-args=(--seed "$seed" --checkpoint "$checkpoint" --results-file "$results" --data-dir "$data_dir")
+args=(--no-accel --seed "$seed" --checkpoint "$checkpoint" --results-file "$results" --data-dir "$data_dir")
 
 case "$phase" in
     digital)
@@ -60,7 +62,7 @@ case "$phase" in
             args+=(--hat-checkpoint "$hat_checkpoint")
         fi
         "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + replicate))" \
-            --no-accel --workers "${WPO_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
+            --workers "${WPO_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
         ;;
     *)
         echo "Unknown MNIST phase: $phase" >&2

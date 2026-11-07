@@ -134,3 +134,16 @@ def test_history_steps_continue_across_epochs_and_retain_all_samples(monkeypatch
     for epoch in history:
         records = epoch['samples']
         assert abs(sum(r.metrics['loss'] * r.count for r in records) / epoch['count'] - epoch['loss']) < 1e-6
+
+
+def test_slurm_cpu_threads_are_explicit_and_do_not_affect_gpu(monkeypatch):
+    calls = []
+    monkeypatch.setenv('SLURM_CPUS_PER_TASK', '64')
+    monkeypatch.setattr(torch, 'set_num_threads', calls.append)
+    monkeypatch.setattr(torch, 'get_num_threads', lambda: 64)
+    mnist_common.configure_cpu_threads(torch.device('cpu'))
+    mnist_common.configure_cpu_threads(torch.device('cuda'))
+    assert calls == [64]
+    monkeypatch.delenv('SLURM_CPUS_PER_TASK')
+    mnist_common.configure_cpu_threads(torch.device('cpu'))
+    assert calls == [64]

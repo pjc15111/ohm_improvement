@@ -32,7 +32,7 @@ from experiments.history import ExperimentHistory, HistoryRecord
 from experiments.mnist.hat import train_hardware_aware
 from experiments.mnist.common import (
     load_digital_model, log_commit, make_loaders, make_rpu_config, report_metrics,
-    select_device, TRAINING_TIMES, UNSEEN_TIMES, evaluation_times,
+    select_device, TRAINING_TIMES, UNSEEN_TIMES, evaluation_times, configure_cpu_threads,
 )
 from ohm_improvement import AnalogModel
 
@@ -398,6 +398,7 @@ def main(argv=None) -> ExperimentHistory:
     start = perf_counter()
     torch.manual_seed(args.seed)
     device = select_device(args.no_accel)
+    configure_cpu_threads(device)
     print(f'HAT device: {device}; WPO device: cpu', flush=True)
     train_loader, test_loader = make_loaders(args, device)
     baseline, metrics = load_baseline(args, test_loader)

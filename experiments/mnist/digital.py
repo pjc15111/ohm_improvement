@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from experiments.common import evaluate_classifier
 from experiments.history import ExperimentHistory, HistoryRecord
 from experiments.mnist.common import (
-    Net, log_commit, make_loaders, report_metrics, synchronize_device,
+    Net, log_commit, make_loaders, report_metrics, synchronize_device, configure_cpu_threads,
 )
 
 
@@ -116,6 +116,7 @@ def main(argv=None):
     start = perf_counter()
     torch.manual_seed(config.seed)
     device = torch.device('cuda' if not config.no_accel and torch.cuda.is_available() else 'cpu')
+    configure_cpu_threads(device)
     print(f'Device: {torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"}', flush=True)
     train_loader, test_loader = make_loaders(config, device)
     model, digital_history = train_digital_model(config, train_loader, test_loader, device)
