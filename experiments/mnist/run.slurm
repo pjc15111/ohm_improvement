@@ -22,7 +22,12 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export MKL_NUM_THREADS=$OMP_NUM_THREADS
 
 checkpoint=$run_dir/checkpoints/seed-$seed.pt
-results=$run_dir/seed-$seed/$phase.json
+label=$phase
+if [[ $phase == oi ]]; then
+    label="oi-$5-r$4"
+fi
+results=$run_dir/seed-$seed/$label.json
+hat_checkpoint=$run_dir/checkpoints/hat-seed-$seed.pt
 data_dir=${MNIST_DATA:-$PWD/data}
 args=(--seed "$seed" --checkpoint "$checkpoint" --results-file "$results" --data-dir "$data_dir")
 
@@ -30,11 +35,18 @@ case "$phase" in
     digital)
         "$python_bin" -m experiments.mnist.digital "${args[@]}" --epochs "$3"
         ;;
+    hat)
+        "$python_bin" -m experiments.mnist.hat "${args[@]}" --hat-epochs "$3" --output-checkpoint "$hat_checkpoint"
+        ;;
     oi)
-        "$python_bin" -m experiments.mnist.oi "${args[@]}" --noise-seed "$((100 + seed))" --oi-epochs "$3"
+        if [[ $5 == hat ]]; then
+            args+=(--hat-checkpoint "$hat_checkpoint")
+        fi
+        "$python_bin" -m experiments.mnist.oi "${args[@]}" --noise-seed "$((100 + seed))" \
+            --oi-epochs "$3" --train-realizations "$4" --evaluation-realizations "$4" --noise-mode "$6"
         ;;
     wpo)
-        "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + seed))" --no-accel --hat-epochs "$3"
+        "$python_bin" -m experiments.mnist.wpo "${args[@]}" --noise-seed "$((100 + seed))" --no-accel --hat-checkpoint "$hat_checkpoint"
         ;;
     *)
         echo "Unknown MNIST phase: $phase" >&2

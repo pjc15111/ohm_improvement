@@ -37,6 +37,7 @@ class ExperimentHistory:
     config: dict
     optimization_history: list[HistoryRecord | dict] = field(default_factory=list)
     results: list[dict] = field(default_factory=list)
+    diagnostics: list[dict] = field(default_factory=list)
     digital_baseline: dict | None = None
     digital_history: list[dict] = field(default_factory=list)
 

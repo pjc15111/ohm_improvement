@@ -2,6 +2,7 @@
 
 import argparse
 from functools import partial
+from torch.utils.data import DataLoader
 
 from experiments.history import ExperimentHistory, HistoryRecord
 from time import perf_counter
@@ -30,6 +31,7 @@ def parse_args(argv=None):
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--checkpoint', default='results/mnist/digital.pt')
+    parser.add_argument('--hat-checkpoint', help='shared HAT weights to initialize OI')
     parser.add_argument('--results-file', default='results/mnist/oi.json')
     parser.add_argument('--data-dir', default='data')
     parser.add_argument('--noise-seed', type=int, default=101)
@@ -40,6 +42,8 @@ def parse_args(argv=None):
     parser.add_argument('--bias-lr', type=float, default=0.0001)
     parser.add_argument('--output-scaling-lr', type=float, default=0.0001)
     parser.add_argument('--train-realizations', type=int, default=4)
+    parser.add_argument('--noise-mode', choices=['fixed', 'fresh'], default='fresh',
+                        help='reuse a fixed noise bank or draw fresh realizations each batch')
     parser.add_argument('--evaluation-realizations', type=int, default=4)
     parser.add_argument('--times', type=float, nargs='+', default=[86400, 30 * 86400, 365 * 86400])
     parser.add_argument('--pair-factors', type=float, nargs='+', default=[1.0])
@@ -87,7 +91,8 @@ def optimize_oi_batch(oi_model: oi.OIModel, inputs, targets, realization_ids, ti
     return dict(loss_sum=total_loss, correct=correct, count=targets.numel() * n_samples, samples=samples)
 
 
-def optimize_oi_epoch(oi_model: oi.OIModel, loader, device, realization_ids, times, optimizer, log_interval):
+def optimize_oi_epoch(oi_model: oi.OIModel, loader, device, realization_ids, times, optimizer,
+                      log_interval, *, noise_mode='fixed', step_offset=0):
     # Keep backend inference behavior while optimizing conductances with autograd.
     oi_model.eval()
     synchronize_device(device)
@@ -95,8 +100,10 @@ def optimize_oi_epoch(oi_model: oi.OIModel, loader, device, realization_ids, tim
     samples = []
     total_loss, correct, count = 0., 0, 0
     for batch_index, (inputs, targets) in enumerate(loader):
+        batch_ids = (realization_ids if noise_mode == 'fixed' else
+                     [f'{name}:step{step_offset + batch_index + 1}' for name in realization_ids])
         batch = optimize_oi_batch(oi_model, inputs.to(device), targets.to(device),
-                                  realization_ids, times, optimizer)
+                                  batch_ids, times, optimizer)
         synchronize_device(device)
         elapsed = perf_counter() - start
         for record in batch['samples']:
@@ -127,7 +134,8 @@ def optimize_oi(args, analog_model: oi.AnalogModel, train_loader, device):
     for epoch in range(1, args.oi_epochs + 1):
         offset = perf_counter() - start
         metrics = optimize_oi_epoch(oi_model, train_loader, device, [f"train{i + 1}" for i in range(args.train_realizations)],
-                                    args.times, optimizer, args.log_interval)
+                                    args.times, optimizer, args.log_interval,
+                                    noise_mode=args.noise_mode, step_offset=(epoch - 1) * len(train_loader))
         elapsed = perf_counter() - start
         for sample in metrics['samples']:
             sample.step = (epoch - 1) * len(train_loader) + sample.batch
@@ -138,14 +146,17 @@ def optimize_oi(args, analog_model: oi.AnalogModel, train_loader, device):
     return oi_model, history
 
 
-def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, device, realization_ids, times, seed):
+def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, device,
+                   realization_ids, times, seed, *, baseline_model=None):
     """Evaluate ordinary and optimized mappings through the same stock simulator."""
     evaluate = partial(evaluate_classifier, loader=loader, device=device)
     # Snapshot both schemes before evaluation mutates the retained analog model.
     evaluators = {
-        'baseline': evaluator_from_analog(analog_model, seed=seed),
+        'baseline': evaluator_from_analog(analog_model if baseline_model is None else baseline_model, seed=seed),
         'oi': evaluator_from_oi(oi_model, analog_model, seed=seed),
     }
+    if baseline_model is not None:
+        evaluators['hat'] = evaluator_from_analog(analog_model, seed=seed)
     realization_ids = tuple(realization_ids)
     times = tuple(times)
     results = []
@@ -153,6 +164,39 @@ def run_comparison(analog_model: oi.AnalogModel, oi_model: oi.OIModel, loader, d
         for record in evaluate_programming(evaluator, evaluate, realization_ids, times):
             results.append(dict(method=method, **record))
             report_metrics(f"{method} {record['realization_id']} t={record['t_inference']}s", record)
+    return results
+
+
+def seen_realizations(history, count):
+    """Select a deterministic, evenly spaced sample of IDs actually used to train."""
+    ids = list(dict.fromkeys(record.realization_id for epoch in history for record in epoch['samples']))
+    count = min(count, len(ids))
+    return [ids[index * len(ids) // count] for index in range(count)]
+
+
+@torch.no_grad()
+def evaluate_generalization(oi_model, loaders, realization_groups, times, device):
+    """Cross data and realization splits using exact OI states in stock snapshots.
+
+    StockProgrammingEvaluator has a different seed derivation, so its `train1`
+    would not reproduce OI's training `train1`. Export the actual OI state instead.
+    """
+    results = []
+    for noise_split, ids in realization_groups.items():
+        for realization_id in ids:
+            oi_model.program(realization_id)
+            for time in times:
+                oi_model.drift(time)
+                snapshot = oi_model.to_analog().eval()
+                for data_split, loader in loaders.items():
+                    metrics = evaluate_classifier(snapshot, loader, device)
+                    results.append(dict(
+                        method='oi', data_split=data_split, realization_split=noise_split,
+                        realization_id=realization_id, t_inference=float(time),
+                        simulator='stock_snapshot', **metrics,
+                    ))
+                    report_metrics(f'OI data={data_split} noise={noise_split} '
+                                   f'{realization_id} t={time}s', metrics)
     return results
 
 
@@ -167,16 +211,26 @@ def main(argv=None):
     train_loader, test_loader = make_loaders(args, device)
     digital_baseline = evaluate_classifier(model, test_loader, device)
     report_metrics('Digital baseline', digital_baseline)
-    analog_model = convert_to_analog(model, rpu_config=make_rpu_config(args.pair_factors)).to(device)
+    initial = load_digital_model(args.hat_checkpoint, device) if args.hat_checkpoint else model
+    analog_model = convert_to_analog(initial, rpu_config=make_rpu_config(args.pair_factors)).to(device)
+    baseline_model = (convert_to_analog(model, rpu_config=make_rpu_config(args.pair_factors)).to(device)
+                      if args.hat_checkpoint else None)
     oi_model, oi_history = optimize_oi(args, analog_model, train_loader, device)
     results = run_comparison(
         analog_model, oi_model, test_loader, device,
         [f'test{i + 1}' for i in range(args.evaluation_realizations)],
-        args.times, args.noise_seed,
+        args.times, args.noise_seed, baseline_model=baseline_model,
+    )
+    seen_loader = DataLoader(train_loader.dataset, batch_size=args.test_batch_size, shuffle=False)
+    diagnostics = evaluate_generalization(
+        oi_model, {'seen': seen_loader, 'unseen': test_loader},
+        {'seen': seen_realizations(oi_history, args.evaluation_realizations),
+         'unseen': [f'test{i + 1}' for i in range(args.evaluation_realizations)]},
+        args.times, device,
     )
     history = ExperimentHistory(
         method='oi', config=vars(args), digital_baseline=digital_baseline,
-        optimization_history=oi_history, results=results,
+        optimization_history=oi_history, results=results, diagnostics=diagnostics,
     )
     history.save(args.results_file)
     print(f'Results: {args.results_file}')

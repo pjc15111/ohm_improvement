@@ -86,8 +86,12 @@ def test_mnist_synthetic_dry_run(monkeypatch, tmp_path):
     sample = saved['optimization_history'][0]['samples'][0]
     assert set(sample['metrics']) == {'loss', 'accuracy'}
     assert sample['step'] == 1 and sample['epoch'] == 1
-    assert sample['seconds'] >= 0 and sample['realization_id'] == 'train1'
+    assert sample['seconds'] >= 0 and sample['realization_id'] == 'train1:step1'
     assert sample['t_inference'] == saved['config']['times'][0]
+    assert {(r['data_split'], r['realization_split']) for r in saved['diagnostics']} == {
+        ('seen', 'seen'), ('seen', 'unseen'), ('unseen', 'seen'), ('unseen', 'unseen')}
+    assert {r['realization_id'] for r in saved['diagnostics'] if r['realization_split'] == 'seen'} == {
+        sample['realization_id']}
     reloaded = torch.load(checkpoint, weights_only=True)
     for name, value in weights.items():
         torch.testing.assert_close(reloaded[name], value, rtol=0, atol=0)
@@ -115,6 +119,7 @@ def test_history_steps_continue_across_epochs_and_retain_all_samples(monkeypatch
     _, history = mnist.optimize_oi(args, analog, loader, device)
     samples = [sample for epoch in history for sample in epoch['samples']]
     assert len(samples) == 16
+    assert len({r.realization_id for r in samples}) == 8
     assert all(is_dataclass(sample) for sample in samples)
     steps = []
     for step, records in groupby(samples, key=lambda sample: sample.step):

@@ -20,20 +20,17 @@ from time import perf_counter
 
 import numpy as np
 import torch
-from torch.nn import functional as F
 
 from aihwkit.inference.converter.conductance import CustomPairConductanceConverter
 from aihwkit.inference.converter.wpo import WeightProgrammingOptimizer, denormalize, stop_criterion
 from aihwkit.nn.conversion import convert_to_analog
-from aihwkit.optim import AnalogSGD
-from aihwkit.simulator.configs import InferenceRPUConfig
-from aihwkit.simulator.parameters.enums import WeightClipType, WeightModifierType
 
 from experiments.common import evaluate_classifier, evaluate_programming, evaluator_from_analog
 from experiments.history import ExperimentHistory, HistoryRecord
+from experiments.mnist.hat import train_hardware_aware
 from experiments.mnist.common import (
     load_digital_model, log_commit, make_loaders, make_rpu_config, report_metrics,
-    select_device, synchronize_device,
+    select_device,
 )
 from ohm_improvement import AnalogModel
 
@@ -42,6 +39,7 @@ def parse_args(argv=None) -> Namespace:
     """Configure checkpoint, data, WPO, evaluation, and results/mnist/wpo.json."""
     parser = argparse.ArgumentParser(description='MNIST stock CPU WPO optimization and evaluation')
     parser.add_argument('--checkpoint', default='results/mnist/digital.pt')
+    parser.add_argument('--hat-checkpoint', help='shared HAT checkpoint; skip in-process HAT')
     parser.add_argument('--results-file', default='results/mnist/wpo.json')
     parser.add_argument('--data-dir', default='data')
     parser.add_argument('--batch-size', type=int, default=64)
@@ -90,6 +88,8 @@ def parse_args(argv=None) -> Namespace:
         parser.error('WPO loss margin must be finite and in [0, 1)')
     if args.hat_epochs < 0:
         parser.error('HAT epochs must be nonnegative')
+    if args.hat_checkpoint and args.hat_epochs:
+        parser.error('use --hat-checkpoint or --hat-epochs, not both')
     if any(not 0 <= seed < 2**63 for seed in (args.seed, args.noise_seed)):
         parser.error('seeds must be integers in [0, 2**63)')
     if any(not math.isfinite(value) or value <= 0 for value in
@@ -120,94 +120,6 @@ def load_baseline(args: Namespace, test_loader) -> tuple[AnalogModel, dict]:
     report_metrics('Digital baseline', metrics)
     analog = convert_to_analog(model, rpu_config=make_rpu_config(args.pair_factors))
     return analog.eval(), metrics
-
-
-def make_hat_config(pair_factors, *, weight_noise=.1, clip_sigma=2.5) -> InferenceRPUConfig:
-    """Add Gaussian training weight noise and layerwise Gaussian clipping.
-
-    These are configurable initial settings, not a paper-matched HAT recipe.
-    Inference I/O, PCM model, mapping, and compensation match the OI baseline.
-    """
-    config = make_rpu_config(pair_factors)
-    config.modifier.type = WeightModifierType.ADD_NORMAL
-    config.modifier.std_dev = weight_noise
-    config.modifier.rel_to_actual_wmax = True
-    config.modifier.enable_during_test = False
-    config.clip.type = WeightClipType.LAYER_GAUSSIAN
-    config.clip.sigma = clip_sigma
-    return config
-
-
-def train_hat_epoch(model, loader, device, optimizer, log_interval) -> dict:
-    model.train()
-    synchronize_device(device)
-    start = perf_counter()
-    batches = []
-    loss_sum, correct, count = 0., 0, 0
-    for index, (inputs, targets) in enumerate(loader, start=1):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        output = model(inputs)
-        loss = F.nll_loss(output, targets)
-        loss.backward()
-        optimizer.step()  # AnalogSGD also applies the tile's clipping/modifier.
-        batch_correct = (output.argmax(-1) == targets).sum().item()
-        count += targets.numel()
-        correct += batch_correct
-        loss_sum += loss.item() * targets.numel()
-        synchronize_device(device)
-        batches.append(HistoryRecord(
-            metrics=dict(loss=loss.item(), accuracy=batch_correct / targets.numel()),
-            batch=index, count=targets.numel(), seconds=perf_counter() - start,
-        ))
-        if (index - 1) % log_interval == 0:
-            report_metrics(f'HAT batch {index - 1}/{len(loader)}', batches[-1].metrics)
-    return dict(loss=loss_sum / count, accuracy=correct / count, count=count, batches=batches)
-
-
-def train_hardware_aware(
-    args: Namespace, analog_model: AnalogModel, train_loader, validation_loader, device,
-) -> tuple[AnalogModel, list[dict]]:
-    """Fine-tune a copy of the digital baseline under hardware-aware settings.
-
-    Use AIHWKIT's analog optimizer and retain training/validation history. HAT
-    may run on GPU; its resulting weights must move to CPU before stock WPO.
-    Preserve the original baseline for the unoptimized comparison.
-    """
-    model = deepcopy(analog_model)
-    if args.hat_epochs == 0:
-        return model.cpu().eval(), []
-    model.replace_rpu_config(make_hat_config(
-        args.pair_factors, weight_noise=args.hat_weight_noise, clip_sigma=args.hat_clip_sigma,
-    ))
-    model.to(device)
-    optimizer = AnalogSGD(model.parameters(), lr=args.hat_lr, momentum=args.hat_momentum)
-    optimizer.regroup_param_groups(model)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.hat_gamma)
-    # Activate noise/clipping for the first batch too, before any optimizer step.
-    for tile in model.analog_tiles():
-        tile.post_update_step()
-    history = []
-    synchronize_device(device)
-    start = perf_counter()
-    for epoch in range(1, args.hat_epochs + 1):
-        offset = perf_counter() - start
-        training = train_hat_epoch(model, train_loader, device, optimizer, args.log_interval)
-        for batch in training['batches']:
-            batch.step = (epoch - 1) * len(train_loader) + batch.batch
-            batch.epoch = epoch - 1 + batch.batch / len(train_loader)
-            batch.seconds += offset
-        evaluation = evaluate_classifier(model, validation_loader, device)
-        elapsed = perf_counter() - start
-        history.append(dict(phase='hat', epoch=epoch, step=epoch * len(train_loader),
-                            seconds=elapsed, training=training, evaluation=evaluation))
-        report_metrics(f'HAT epoch {epoch} training ({elapsed:.2f}s)', training)
-        report_metrics(f'HAT epoch {epoch} evaluation', evaluation)
-        scheduler.step()
-    # Hand WPO clean reference weights, without HAT's modified training copy.
-    model.eval()
-    model.replace_rpu_config(make_rpu_config(args.pair_factors))
-    return model.cpu(), history
 
 
 @contextmanager
@@ -429,7 +341,7 @@ def run_comparison(
     evaluators = {'baseline': evaluator_from_analog(
         deepcopy(analog_model if baseline_model is None else baseline_model), seed=args.noise_seed,
     )}
-    if args.hat_epochs:
+    if args.hat_epochs or args.hat_checkpoint:
         evaluators['hat'] = evaluator_from_analog(deepcopy(analog_model), seed=args.noise_seed)
     evaluators['wpo'] = evaluator_from_analog(
         deepcopy(analog_model), converter=converter, seed=args.noise_seed,
@@ -455,7 +367,14 @@ def main(argv=None) -> ExperimentHistory:
     train_loader, test_loader = make_loaders(args, device)
     baseline, metrics = load_baseline(args, test_loader)
     # The test loader supplies reporting only; no early stopping/model selection.
-    prepared, hat_history = train_hardware_aware(args, baseline, train_loader, test_loader, device)
+    if args.hat_checkpoint:
+        prepared = convert_to_analog(
+            load_digital_model(args.hat_checkpoint, torch.device('cpu')),
+            make_rpu_config(args.pair_factors),
+        ).eval()
+        hat_history = []
+    else:
+        prepared, hat_history = train_hardware_aware(args, baseline, train_loader, test_loader, device)
     history = ExperimentHistory(
         method='wpo', config={**vars(args), 'stage': 'optimization'},
         digital_baseline=metrics, optimization_history=hat_history,

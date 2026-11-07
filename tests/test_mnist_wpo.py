@@ -23,7 +23,7 @@ from aihwkit.optim import AnalogSGD
 from aihwkit.simulator import rpu_base
 from aihwkit.simulator.parameters.enums import WeightClipType, WeightModifierType
 
-from experiments.mnist import common, wpo
+from experiments.mnist import common, hat, wpo
 
 
 @pytest.fixture(params=['cpu', 'cuda'])
@@ -40,7 +40,7 @@ def test_hat_config_and_cli_defaults():
     args = wpo.parse_args(['--dry-run', '--hat-epochs', '3'])
     assert args.hat_epochs == args.evaluation_realizations == len(args.times) == 1
     assert args.wpo_maxiter == 1 and not args.wpo_polish and args.workers == 1
-    cfg = wpo.make_hat_config([1., 2.], weight_noise=.06, clip_sigma=3.)
+    cfg = hat.make_hat_config([1., 2.], weight_noise=.06, clip_sigma=3.)
     assert cfg.modifier.type == WeightModifierType.ADD_NORMAL
     assert cfg.modifier.std_dev == .06 and not cfg.modifier.enable_during_test
     assert cfg.clip.type == WeightClipType.LAYER_GAUSSIAN and cfg.clip.sigma == 3.
@@ -71,7 +71,7 @@ def test_hat_updates_copy_records_steps_and_returns_clean_cpu_model(device, epoc
         torch.tensor([[.2, -.4, .8], [.1, .3, -.2], [.4, .2, .1]]),
         torch.tensor([0, 1, 0]),
     ), batch_size=2)
-    trained, history = wpo.train_hardware_aware(args, analog, loader, loader, device)
+    trained, history = hat.train_hardware_aware(args, analog, loader, loader, device)
     assert trained is not analog and not trained.training
     for tile, initial in zip(analog.analog_tiles(), before):
         for actual, expected in zip(tile.get_weights(), initial):
@@ -102,7 +102,7 @@ def test_hat_updates_copy_records_steps_and_returns_clean_cpu_model(device, epoc
 
 @pytest.mark.parametrize('weight_noise,clip_sigma', [(.2, 100.), (0., .1)])
 def test_hat_training_noise_and_optimizer_clipping_are_active(device, weight_noise, clip_sigma):
-    cfg = wpo.make_hat_config([1.], weight_noise=weight_noise, clip_sigma=clip_sigma)
+    cfg = hat.make_hat_config([1.], weight_noise=weight_noise, clip_sigma=clip_sigma)
     cfg.forward.is_perfect = True
     digital = nn.Sequential(nn.Linear(3, 2, bias=False), nn.LogSoftmax(-1))
     with torch.no_grad():
@@ -115,7 +115,7 @@ def test_hat_training_noise_and_optimizer_clipping_are_active(device, weight_noi
     optimizer.regroup_param_groups(model)
     x = torch.tensor([[.2, -.4, .8], [.1, .3, -.2]], device=device)
     loader = DataLoader(TensorDataset(x, torch.tensor([0, 1], device=device)), batch_size=2)
-    wpo.train_hat_epoch(model, loader, device, optimizer, log_interval=10)
+    hat.train_hat_epoch(model, loader, device, optimizer, log_interval=10)
     reference = tile.get_weights()[0].to(device)
     with torch.no_grad():
         noisy = model.train()(x)

@@ -117,27 +117,67 @@ To submit five paired seeds on SLURM:
 bash experiments/mnist/submit.sh
 ```
 
-Digital training runs on GPUs for 14 epochs, followed by five OI epochs by default.
-Each WPO job requests 64 physical CPU cores (`--hint=nomultithread`). Each CPU WPO task
-can start as soon as its matching digital task succeeds. OI GPU tasks wait for
-**all** digital tasks to succeed, so OI cannot hold GPUs needed by the remaining
-baselines. No GPU type or concurrency limit is imposed. The scripts use the
-repository's `venv` and current checkout.
+The wrapper uses five seeds, 14 digital epochs, and five HAT/OI epochs. It runs
+four OI conditions per seed: digital initialization with 4 or 16 realizations,
+and HAT initialization with 4 or 16 realizations. Each condition uses that many
+fresh noise realizations per minibatch by default. Digital baseline training
+remains noise-free; "fresh noise" here refers to OI's programming/drift/read
+samples, not input noise in the digital network. The network architecture is
+unchanged for this ablation.
+
+HAT runs once per seed on GPU and saves a shared checkpoint. Both HAT+OI
+conditions and CPU WPO load those exact weights. All digital jobs finish before
+HAT starts; all HAT jobs finish before any OI job starts. Each CPU WPO task can
+start as soon as its own HAT checkpoint is ready. No GPU type or concurrency
+limit is imposed. The scripts use the repository's `venv` and current checkout.
 
 Set `RUNS`, `DIGITAL_EPOCHS`, `OI_EPOCHS`, `HAT_EPOCHS` (default five),
-`GPU_PARTITION` (default `general-gpu`),
-`CPU_PARTITION` (default `general`), `GPU_TIME` (default `00:15:00`), or `WPO_TIME`
-(default `04:00:00`) before submission to override settings. `MNIST_DATA` can
-select an existing shared dataset directory; otherwise the scripts use `data`.
-WPO requests 64 GB per job by default, independently of the GPU jobs' 16 GB;
-override with `WPO_MEM`, for example `WPO_MEM=128G bash experiments/mnist/submit.sh`.
-Spawned workers each load Python/AIHWKIT, so memory usage grows with worker count;
-the larger default is a starting allocation, not a measured peak requirement.
+`NOISE_MODE` (`fresh` or `fixed`), `GPU_PARTITION` (default `general-gpu`),
+`CPU_PARTITION` (default `general`), `GPU_TIME`, or `WPO_TIME` before submission.
+Both compute time limits default to **02:00:00**. `MNIST_DATA` can select an
+existing shared dataset directory; otherwise the scripts use `data`.
+WPO requests 64 physical CPU cores and 64 GB per job, independently of the GPU
+jobs' 16 GB; override memory with `WPO_MEM`. Spawned workers each load
+Python/AIHWKIT, so memory usage grows with worker count.
 
 The wrapper prints job IDs and a directory under `results/mnist/run-*`.
-Each `seed-N` directory contains `digital.log`, `oi.log`, `wpo.log`, and their
-history JSON files. Temporary checkpoints are removed by a final cleanup job,
-even after a failed stage. Only logs and histories are retained.
+Each `seed-N` directory contains these log/history pairs:
+
+- `digital.log` / `digital.json`
+- `hat.log` / `hat.json`
+- `wpo.log` / `wpo.json`
+- `oi-digital-r4.log` / `oi-digital-r4.json`
+- `oi-digital-r16.log` / `oi-digital-r16.json`
+- `oi-hat-r4.log` / `oi-hat-r4.json`
+- `oi-hat-r16.log` / `oi-hat-r16.json`
+
+Digital and HAT checkpoints are temporary handoffs. A final cleanup job removes
+them after every stage terminates, leaving only logs and histories.
+
+OI's `results` retain the ordinary stock-noise comparisons on the test dataset.
+The separate `diagnostics` field records the Cartesian product of
+`data_split = seen/unseen` and `realization_split = seen/unseen`, at each inference
+time. Seen data is the full MNIST training dataset; unseen data is the test
+split. Evaluation uses 4 realizations per group for the r4 condition and 16 for
+r16. Seen IDs are selected evenly throughout the unique realization IDs actually
+used during training; unseen IDs use a separate `testN` namespace. With fixed
+noise, evaluation covers the entire fixed training bank.
+
+Diagnostics generate exact OI realization states and export stock analog
+snapshots (`simulator = stock_snapshot`) for inference on both data splits.
+This is necessary because stock evaluation and OI use different seed derivations:
+passing the name `train1` to the stock evaluator would not reproduce OI's
+training noise. Backend forward/calibration randomness remains uncontrolled.
+
+For standalone ablations, use `--noise-mode fresh` (default) or `fixed`,
+`--train-realizations`, and `--evaluation-realizations`. Fresh IDs include the
+optimizer step, making them reproducible without retaining noise tensors. To
+prepare shared HAT weights directly:
+
+```bash
+python -m experiments.mnist.hat --hat-epochs 5
+python -m experiments.mnist.oi --hat-checkpoint results/mnist/hat.pt --train-realizations 16
+```
 
 The WPO command loads the same checkpoint, optionally fine-tunes a copy with HAT,
 then runs stock AIHWKIT WPO on CPU. It learns one shared conductance converter
@@ -178,9 +218,10 @@ History is saved after every generation so interrupted jobs retain progress.
 converter's pair factors and conductance curves are included in
 `config.wpo_converter`; no additional result artifacts are written.
 
-Standalone HAT defaults to off (`--hat-epochs 0`); the SLURM wrapper runs five
+In-process HAT in the WPO program defaults to off (`--hat-epochs 0`); the SLURM wrapper runs five
 HAT epochs by default. For example, `HAT_EPOCHS=0 bash experiments/mnist/submit.sh`
-skips HAT. When enabled, it uses `AnalogSGD` with
+skips HAT updates. `--hat-checkpoint` loads shared pretrained weights in OI or
+WPO. HAT uses `AnalogSGD` with
 learning rate 0.01, momentum 0.9, and epoch LR decay 0.7. Training weight noise
 has standard deviation 0.1 relative to each tile's maximum, with clipping at
 2.5 standard deviations. These are configurable starting settings, not a
